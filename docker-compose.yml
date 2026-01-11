@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  alpha-hunter:
+    build: .
+    container_name: alpha-hunter-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=production
