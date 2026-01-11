@@ -459,7 +459,7 @@ Use /scan ${analysis.token.contractAddress} for full analysis
 
   start(): void {
     logger.info('🤖 Telegram bot started');
-    this.bot.sendMessage(config.telegram.botToken, '🚀 Alpha Hunter is online!');
+    logger.info('🚀 Alpha Hunter is online and ready to respond to messages!');
   }
 }
 
