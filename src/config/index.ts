@@ -1,0 +1,169 @@
+import dotenv from 'dotenv';
+import { TradingPreset } from '../types';
+
+dotenv.config();
+
+export const config = {
+  telegram: {
+    botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+  },
+  solana: {
+    rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+    walletPrivateKey: process.env.SOLANA_WALLET_PRIVATE_KEY || '',
+  },
+  apis: {
+    helius: process.env.HELIUS_API_KEY || '',
+    birdeye: process.env.BIRDEYE_API_KEY || '',
+  },
+  trading: {
+    paperTrading: process.env.PAPER_TRADING === 'true',
+    defaultPreset: process.env.DEFAULT_PRESET || 'balanced',
+    maxPositionSizeSol: parseFloat(process.env.MAX_POSITION_SIZE_SOL || '1.0'),
+    slippageBps: parseInt(process.env.SLIPPAGE_BPS || '100'),
+  },
+  scanner: {
+    scanIntervalMs: parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
+    minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '10000'),
+    minVolume24hUsd: parseFloat(process.env.MIN_VOLUME_24H_USD || '50000'),
+  },
+  learning: {
+    enabled: process.env.LEARNING_ENABLED === 'true',
+    minPatternConfidence: parseFloat(process.env.MIN_PATTERN_CONFIDENCE || '0.6'),
+    antiDriftThreshold: parseFloat(process.env.ANTI_DRIFT_THRESHOLD || '0.15'),
+  },
+  database: {
+    path: process.env.DB_PATH || './data/alpha-hunter.db',
+  },
+  logging: {
+    level: process.env.LOG_LEVEL || 'info',
+    file: process.env.LOG_FILE || './logs/alpha-hunter.log',
+  },
+};
+
+export const TRADING_PRESETS: Record<string, TradingPreset> = {
+  conservative: {
+    name: 'Conservative',
+    description: 'Low risk, high confidence only',
+    maxPositionSizeSol: 0.5,
+    minConfidence: 0.85,
+    takeProfitPercentage: 50,
+    stopLossPercentage: 15,
+    maxOpenPositions: 3,
+    riskLevel: 'conservative',
+  },
+  moderate: {
+    name: 'Moderate',
+    description: 'Balanced risk/reward',
+    maxPositionSizeSol: 1.0,
+    minConfidence: 0.75,
+    takeProfitPercentage: 100,
+    stopLossPercentage: 25,
+    maxOpenPositions: 5,
+    riskLevel: 'moderate',
+  },
+  balanced: {
+    name: 'Balanced',
+    description: 'Standard runner hunting',
+    maxPositionSizeSol: 1.5,
+    minConfidence: 0.65,
+    takeProfitPercentage: 150,
+    stopLossPercentage: 30,
+    maxOpenPositions: 7,
+    riskLevel: 'balanced',
+  },
+  aggressive: {
+    name: 'Aggressive',
+    description: 'Higher risk for higher returns',
+    maxPositionSizeSol: 2.5,
+    minConfidence: 0.55,
+    takeProfitPercentage: 300,
+    stopLossPercentage: 40,
+    maxOpenPositions: 10,
+    riskLevel: 'aggressive',
+  },
+  degen: {
+    name: 'Degen',
+    description: 'YOLO mode - maximum risk',
+    maxPositionSizeSol: 5.0,
+    minConfidence: 0.45,
+    takeProfitPercentage: 500,
+    stopLossPercentage: 50,
+    maxOpenPositions: 15,
+    riskLevel: 'degen',
+  },
+};
+
+export const RUNNER_PATTERNS: any[] = [
+  {
+    id: 'smart_money_entry',
+    name: 'Smart Money Entry',
+    description: 'Known winning wallets accumulating',
+    signals: [
+      { type: 'wallet', metric: 'isSmartMoney', operator: 'eq', value: 1, weight: 0.4 },
+      { type: 'wallet', metric: 'profitRate', operator: 'gte', value: 0.7, weight: 0.3 },
+      { type: 'technical', metric: 'volumeBreakout', operator: 'eq', value: 1, weight: 0.3 },
+    ],
+  },
+  {
+    id: 'volume_breakout',
+    name: 'Volume Breakout',
+    description: 'Massive volume spike with strong momentum',
+    signals: [
+      { type: 'technical', metric: 'volumeBreakout', operator: 'eq', value: 1, weight: 0.5 },
+      { type: 'technical', metric: 'priceAction', operator: 'eq', value: 1, weight: 0.3 },
+      { type: 'fundamental', metric: 'liquidityScore', operator: 'gte', value: 0.7, weight: 0.2 },
+    ],
+  },
+  {
+    id: 'fresh_launch',
+    name: 'Fresh Launch',
+    description: 'New token with strong fundamentals',
+    signals: [
+      { type: 'fundamental', metric: 'tokenAge', operator: 'lte', value: 24, weight: 0.3 },
+      { type: 'fundamental', metric: 'liquidityLocked', operator: 'eq', value: 1, weight: 0.3 },
+      { type: 'fundamental', metric: 'uniqueHolders', operator: 'gte', value: 100, weight: 0.2 },
+      { type: 'social', metric: 'trendingScore', operator: 'gte', value: 0.6, weight: 0.2 },
+    ],
+  },
+  {
+    id: 'whale_accumulation',
+    name: 'Whale Accumulation',
+    description: 'Large holders steadily buying',
+    signals: [
+      { type: 'wallet', metric: 'isWhale', operator: 'eq', value: 1, weight: 0.5 },
+      { type: 'technical', metric: 'priceAction', operator: 'eq', value: 1, weight: 0.3 },
+      { type: 'fundamental', metric: 'topHolderPercentage', operator: 'lte', value: 30, weight: 0.2 },
+    ],
+  },
+  {
+    id: 'social_momentum',
+    name: 'Social Momentum',
+    description: 'Viral on CT with strong community',
+    signals: [
+      { type: 'social', metric: 'twitterMentions', operator: 'gte', value: 100, weight: 0.3 },
+      { type: 'social', metric: 'influencerEngagement', operator: 'gte', value: 5, weight: 0.3 },
+      { type: 'social', metric: 'sentiment', operator: 'eq', value: 1, weight: 0.2 },
+      { type: 'fundamental', metric: 'uniqueHolders', operator: 'gte', value: 500, weight: 0.2 },
+    ],
+  },
+  {
+    id: 'stealth_accumulation',
+    name: 'Stealth Accumulation',
+    description: 'Low-key buying before breakout',
+    signals: [
+      { type: 'wallet', metric: 'isSmartMoney', operator: 'eq', value: 1, weight: 0.4 },
+      { type: 'technical', metric: 'volatility', operator: 'lte', value: 0.3, weight: 0.3 },
+      { type: 'fundamental', metric: 'holderConcentration', operator: 'gte', value: 0.6, weight: 0.3 },
+    ],
+  },
+  {
+    id: 'dev_locked',
+    name: 'Dev Locked & Loaded',
+    description: 'Dev wallet locked, liquidity secured',
+    signals: [
+      { type: 'fundamental', metric: 'devWalletLocked', operator: 'eq', value: 1, weight: 0.4 },
+      { type: 'fundamental', metric: 'liquidityLocked', operator: 'eq', value: 1, weight: 0.4 },
+      { type: 'social', metric: 'sentiment', operator: 'eq', value: 1, weight: 0.2 },
+    ],
+  },
+];
