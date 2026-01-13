@@ -10,7 +10,10 @@ import db from '../database';
 export class TokenScanner {
   private isScanning: boolean = false;
   private scanInterval: NodeJS.Timeout | null = null;
+  private paperTradeInterval: NodeJS.Timeout | null = null;
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
+  private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string }) => void> = [];
+  private buySignalCallbacks: Array<(analysis: AnalysisResult) => void> = [];
   private stats = {
     tokensScanned: 0,
     alertsTriggered: 0,
@@ -59,6 +62,20 @@ export class TokenScanner {
   }
 
   /**
+   * Register callback for scan notifications
+   */
+  onScanNotify(callback: (tokenInfo: { address: string; name?: string; symbol?: string }) => void): void {
+    this.scanNotifyCallbacks.push(callback);
+  }
+
+  /**
+   * Register callback for buy signals
+   */
+  onBuySignal(callback: (analysis: AnalysisResult) => void): void {
+    this.buySignalCallbacks.push(callback);
+  }
+
+  /**
    * Check if scanner is active
    */
   isActive(): boolean {
@@ -85,6 +102,9 @@ export class TokenScanner {
       logger.info(`Found ${trendingTokens.length} trending tokens`);
 
       for (const tokenAddress of trendingTokens) {
+        // Notify that we're scanning this token
+        this.notifyScan(tokenAddress);
+
         await this.analyzeAndAct(tokenAddress);
         this.stats.tokensScanned++;
         this.stats.lastScanTime = Date.now();
@@ -150,10 +170,18 @@ export class TokenScanner {
         `Recommendation: ${analysis.recommendation}`
       );
 
+      // Check if this is a good token (potential 2x or better)
+      const isPotentialRunner = this.isPotentialRunner(analysis);
+
       // Always paper trade every signal (as per requirement)
       if (analysis.recommendation === 'strong_buy' || analysis.recommendation === 'buy') {
         // Paper trade regardless of auto-trade settings
         await tradingEngine.buy(analysis, 1.0, 0, true);
+
+        // Send buy signal if it's a good token
+        if (isPotentialRunner) {
+          this.sendBuySignal(analysis);
+        }
 
         // Send alert to users
         this.sendAlert(analysis);
@@ -225,6 +253,89 @@ export class TokenScanner {
           patternLearner.recordTrade(position, patterns);
         }
       }
+    }
+  }
+
+  /**
+   * Notify scan callbacks that a token is being scanned
+   */
+  private notifyScan(contractAddress: string): void {
+    for (const callback of this.scanNotifyCallbacks) {
+      try {
+        callback({ address: contractAddress });
+      } catch (error) {
+        logger.error('Error in scan notify callback:', error);
+      }
+    }
+  }
+
+  /**
+   * Send buy signal to registered callbacks
+   */
+  private sendBuySignal(analysis: AnalysisResult): void {
+    for (const callback of this.buySignalCallbacks) {
+      try {
+        callback(analysis);
+      } catch (error) {
+        logger.error('Error in buy signal callback:', error);
+      }
+    }
+  }
+
+  /**
+   * Check if a token has potential for 2x or better
+   */
+  private isPotentialRunner(analysis: AnalysisResult): boolean {
+    const { overallScore, confidence, technical, fundamental } = analysis;
+
+    // Strong buy with high confidence
+    if (overallScore >= 70 && confidence >= 0.7) return true;
+
+    // Buy with very high confidence
+    if (overallScore >= 60 && confidence >= 0.75) return true;
+
+    // Volume breakout with good fundamentals
+    if (technical.volumeBreakout && fundamental.liquidityLocked && overallScore >= 60) return true;
+
+    // Smart money detected with decent score
+    if (analysis.walletSignals && analysis.walletSignals.some(w => w.isSmartMoney) && overallScore >= 55) return true;
+
+    return false;
+  }
+
+  /**
+   * Start automated paper trading - finds tokens every 2 minutes or less
+   */
+  startAutomatedPaperTrading(): void {
+    if (this.paperTradeInterval) {
+      logger.warn('Automated paper trading already running');
+      return;
+    }
+
+    logger.info('🤖 Starting automated paper trading');
+
+    // Run every 2 minutes (120000ms)
+    this.paperTradeInterval = setInterval(async () => {
+      try {
+        logger.info('🔍 Automated paper trade scan starting...');
+        await this.scan();
+      } catch (error) {
+        logger.error('Error in automated paper trading:', error);
+      }
+    }, 120000);
+
+    // Run initial scan immediately
+    this.scan().catch(error => logger.error('Initial automated scan error:', error));
+  }
+
+  /**
+   * Stop automated paper trading
+   */
+  stopAutomatedPaperTrading(): void {
+    if (this.paperTradeInterval) {
+      clearInterval(this.paperTradeInterval);
+      this.paperTradeInterval = null;
+      logger.info('Automated paper trading stopped');
     }
   }
 
