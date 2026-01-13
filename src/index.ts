@@ -16,7 +16,7 @@ async function main() {
 
     // Initialize bot
     const bot = new AlphaHunterBot();
-    bot.start();
+    await bot.start();
 
     // Start position monitoring
     setInterval(async () => {
