@@ -160,6 +160,25 @@ class DatabaseManager {
       )
     `);
 
+    // Successful patterns table (2x+ winners for learning)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS successful_patterns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        contract_address TEXT,
+        entry_price REAL,
+        pnl_percentage REAL,
+        overall_score INTEGER,
+        confidence REAL,
+        recommendation TEXT,
+        patterns TEXT,
+        technical_score TEXT,
+        fundamental_score TEXT,
+        timestamp TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     logger.info('Database initialized successfully');
   }
 
@@ -451,6 +470,65 @@ class DatabaseManager {
   completeDCAOrder(orderId: number): void {
     const stmt = this.db.prepare('UPDATE dca_orders SET status = ? WHERE id = ?');
     stmt.run('completed', orderId);
+  }
+
+  saveSuccessfulPattern(data: any): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO successful_patterns (
+        symbol, contract_address, entry_price, pnl_percentage, overall_score,
+        confidence, recommendation, patterns, technical_score, fundamental_score, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      data.symbol,
+      data.contractAddress,
+      data.entryPrice,
+      data.pnlPercentage,
+      data.overallScore,
+      data.confidence,
+      data.recommendation,
+      data.patterns,
+      JSON.stringify(data.technicalScore),
+      JSON.stringify(data.fundamentalScore),
+      data.timestamp
+    );
+  }
+
+  getSuccessfulPatterns(minPnlPercentage: number = 100): any[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM successful_patterns
+      WHERE pnl_percentage >= ?
+      ORDER BY created_at DESC
+    `);
+
+    return stmt.all(minPnlPercentage) as any[];
+  }
+
+  getAllPaperTrades(userId: number = 0): any[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM positions
+      WHERE user_id = ? AND type = 'paper'
+      ORDER BY opened_at DESC
+    `);
+
+    return stmt.all(userId) as any[];
+  }
+
+  getPaperTradeStats(userId: number = 0): any {
+    const stmt = this.db.prepare(`
+      SELECT
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_trades,
+        SUM(CASE WHEN status = 'closed' AND pnl > 0 THEN 1 ELSE 0 END) as winners,
+        SUM(CASE WHEN status = 'closed' AND pnl <= 0 THEN 1 ELSE 0 END) as losers,
+        AVG(pnl_percentage) as avg_pnl_percentage,
+        SUM(pnl) as total_pnl
+      FROM positions
+      WHERE user_id = ? AND type = 'paper'
+    `);
+
+    return stmt.get(userId);
   }
 
   close(): void {

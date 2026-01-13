@@ -14,6 +14,7 @@ export class TokenScanner {
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
   private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string }) => void> = [];
   private buySignalCallbacks: Array<(analysis: AnalysisResult) => void> = [];
+  private scannedTokens: Set<string> = new Set(); // Track scanned tokens to avoid duplicates
   private stats = {
     tokensScanned: 0,
     alertsTriggered: 0,
@@ -31,6 +32,13 @@ export class TokenScanner {
 
     this.isScanning = true;
     logger.info('🔍 Token scanner started');
+
+    // Clear scanned tokens cache every 24 hours
+    setInterval(() => {
+      const previousSize = this.scannedTokens.size;
+      this.scannedTokens.clear();
+      logger.info(`🔄 Cleared scanned tokens cache (${previousSize} tokens removed)`);
+    }, 86400000); // 24 hours
 
     // Run initial scan
     this.scan();
@@ -86,7 +94,10 @@ export class TokenScanner {
    * Get scanning statistics
    */
   getStats() {
-    return { ...this.stats };
+    return {
+      ...this.stats,
+      uniqueTokensScanned: this.scannedTokens.size,
+    };
   }
 
   /**
@@ -102,6 +113,15 @@ export class TokenScanner {
       logger.info(`Found ${trendingTokens.length} trending tokens`);
 
       for (const tokenAddress of trendingTokens) {
+        // Skip if already scanned
+        if (this.scannedTokens.has(tokenAddress)) {
+          logger.info(`⏭️ Skipping ${tokenAddress} - already scanned`);
+          continue;
+        }
+
+        // Mark as scanned
+        this.scannedTokens.add(tokenAddress);
+
         // Notify that we're scanning this token
         this.notifyScan(tokenAddress);
 
@@ -120,39 +140,58 @@ export class TokenScanner {
   }
 
   /**
-   * Get trending tokens from various sources
+   * Get trending tokens from launchpads only (PumpFun, Meteora, etc.)
    */
   private async getTrendingTokens(): Promise<string[]> {
     const tokens: string[] = [];
 
     try {
-      // Search for high-volume tokens
-      const searches = ['sol', 'pump', 'bonk', 'wif', 'meme'];
+      logger.info('🚀 Scanning launchpad tokens (PumpFun, Meteora, etc.)...');
 
+      // Get new pairs from Solana
+      const allPairs = await dexScreener.getNewPairs();
+      logger.info(`Found ${allPairs.length} total pairs`);
+
+      // Filter for launchpad tokens only
+      const launchpadPairs = allPairs.filter(pair => dexScreener.isFromLaunchpad(pair));
+      logger.info(`Filtered to ${launchpadPairs.length} launchpad tokens`);
+
+      // Also search for specific launchpad keywords
+      const searches = ['pump', 'pumpfun', 'meteora'];
       for (const query of searches) {
         const pairs = await dexScreener.searchPairs(query);
 
         for (const pair of pairs) {
-          if (!pair.baseToken?.address) continue;
-
-          const volume24h = parseFloat(pair.volume?.h24 || '0');
-          const liquidity = parseFloat(pair.liquidity?.usd || '0');
-
-          // Filter by minimum requirements
-          if (
-            volume24h >= config.scanner.minVolume24hUsd &&
-            liquidity >= config.scanner.minLiquidityUsd
-          ) {
-            tokens.push(pair.baseToken.address);
+          if (dexScreener.isFromLaunchpad(pair)) {
+            launchpadPairs.push(pair);
           }
         }
       }
+
+      // Process launchpad pairs
+      for (const pair of launchpadPairs) {
+        if (!pair.baseToken?.address) continue;
+
+        const volume24h = parseFloat(pair.volume?.h24 || '0');
+        const liquidity = parseFloat(pair.liquidity?.usd || '0');
+
+        // Lower requirements for launchpad tokens (they're newer)
+        if (
+          volume24h >= config.scanner.minVolume24hUsd * 0.5 && // 50% of normal requirement
+          liquidity >= config.scanner.minLiquidityUsd * 0.5    // 50% of normal requirement
+        ) {
+          tokens.push(pair.baseToken.address);
+          logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} from ${pair.dexId}`);
+        }
+      }
     } catch (error) {
-      logger.error('Error fetching trending tokens:', error);
+      logger.error('Error fetching launchpad tokens:', error);
     }
 
     // Remove duplicates
-    return [...new Set(tokens)];
+    const uniqueTokens = [...new Set(tokens)];
+    logger.info(`📊 Final count: ${uniqueTokens.length} unique launchpad tokens to analyze`);
+    return uniqueTokens;
   }
 
   /**
@@ -170,20 +209,22 @@ export class TokenScanner {
         `Recommendation: ${analysis.recommendation}`
       );
 
+      // PAPER TRADE ALL SCANNED TOKENS (not just buy signals)
+      // This allows us to learn from all patterns, including failed ones
+      logger.info(`📝 Paper trading ${analysis.token.symbol} for learning...`);
+      await tradingEngine.buy(analysis, 0.1, 0, true); // Small amount (0.1 SOL) for tracking
+
       // Check if this is a good token (potential 2x or better)
       const isPotentialRunner = this.isPotentialRunner(analysis);
 
-      // Always paper trade every signal (as per requirement)
+      // Send buy signal if it's a good token
+      if (isPotentialRunner) {
+        logger.info(`🚨 BUY SIGNAL: ${analysis.token.symbol} shows 2x+ potential!`);
+        this.sendBuySignal(analysis);
+      }
+
+      // Send alert to users for buy/strong_buy recommendations
       if (analysis.recommendation === 'strong_buy' || analysis.recommendation === 'buy') {
-        // Paper trade regardless of auto-trade settings
-        await tradingEngine.buy(analysis, 1.0, 0, true);
-
-        // Send buy signal if it's a good token
-        if (isPotentialRunner) {
-          this.sendBuySignal(analysis);
-        }
-
-        // Send alert to users
         this.sendAlert(analysis);
 
         // Auto-trade for users who have it enabled
@@ -242,6 +283,12 @@ export class TokenScanner {
     for (const position of positions) {
       await tradingEngine.updatePosition(position);
 
+      // Track 2x+ winners for learning
+      if (position.pnlPercentage && position.pnlPercentage >= 100) {
+        logger.info(`🎉 2X WINNER DETECTED: ${position.symbol} at +${position.pnlPercentage.toFixed(2)}%!`);
+        await this.record2xWinner(position);
+      }
+
       if (tradingEngine.shouldClosePosition(position, userId)) {
         logger.info(`Closing position ${position.symbol} due to take profit/stop loss`);
 
@@ -251,8 +298,49 @@ export class TokenScanner {
           // Record learning data
           const patterns = patternLearner.getUpdatedPatterns();
           patternLearner.recordTrade(position, patterns);
+
+          // If this was a 2x+ winner, extract winning patterns
+          if (position.pnlPercentage && position.pnlPercentage >= 100) {
+            await this.learnFrom2xWinner(position);
+          }
         }
       }
+    }
+  }
+
+  /**
+   * Record a 2x+ winner for learning
+   */
+  private async record2xWinner(position: any): Promise<void> {
+    try {
+      // Get the original analysis for this position
+      const analysis = await tokenAnalyzer.analyzeToken(position.contract_address);
+      if (!analysis) return;
+
+      logger.info(`📚 Recording 2x+ winner pattern for ${position.symbol}`);
+      logger.info(`   Score: ${analysis.overallScore}, Confidence: ${(analysis.confidence * 100).toFixed(0)}%`);
+      logger.info(`   Patterns matched: ${analysis.matchedPatterns?.map(p => p.name).join(', ')}`);
+
+      // Store this as a successful example
+      patternLearner.recordSuccessfulTrade(position, analysis);
+    } catch (error) {
+      logger.error('Error recording 2x winner:', error);
+    }
+  }
+
+  /**
+   * Learn from 2x+ winners to improve strategy
+   */
+  private async learnFrom2xWinner(position: any): Promise<void> {
+    try {
+      logger.info(`🧠 Learning from ${position.symbol} (${position.pnlPercentage.toFixed(2)}% gain)...`);
+
+      // Extract patterns and update weights
+      await patternLearner.enhanceWinningPatterns(position);
+
+      logger.info(`✅ Strategy updated based on ${position.symbol}'s success`);
+    } catch (error) {
+      logger.error('Error learning from winner:', error);
     }
   }
 

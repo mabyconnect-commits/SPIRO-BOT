@@ -76,6 +76,7 @@ export class AlphaHunterBot {
     this.bot.onText(/\/favorites/, this.handleFavorites.bind(this));
     this.bot.onText(/\/dcaorders/, this.handleDCAOrders.bind(this));
     this.bot.onText(/\/tpslorders/, this.handleTPSLOrders.bind(this));
+    this.bot.onText(/\/papertrades/, this.handlePaperTrades.bind(this));
 
     logger.info('Telegram bot commands registered');
   }
@@ -245,6 +246,11 @@ ${this.getPotentialText(analysis)}
             `;
 
             const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+
+            // Shorten symbol and name to avoid exceeding 64-byte callback limit
+            const shortSymbol = analysis.token.symbol.substring(0, 10);
+            const shortName = analysis.token.name.substring(0, 15);
+
             const keyboard = {
               inline_keyboard: [
                 [
@@ -256,8 +262,8 @@ ${this.getPotentialText(analysis)}
                   { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
                 ],
                 [
-                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${analysis.token.symbol}` },
-                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${shortSymbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${shortSymbol}:${shortName}` },
                 ],
                 [
                   { text: '📊 Full Details', callback_data: `details:${analysis.token.contractAddress}` },
@@ -316,6 +322,11 @@ ${this.getPotentialText(analysis)}
 
             // Show action buttons
             const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+
+            // Shorten symbol and name to avoid exceeding 64-byte callback limit
+            const shortSymbol = analysis.token.symbol.substring(0, 10);
+            const shortName = analysis.token.name.substring(0, 15);
+
             const keyboard = {
               inline_keyboard: [
                 [
@@ -327,11 +338,12 @@ ${this.getPotentialText(analysis)}
                   { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
                 ],
                 [
-                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${analysis.token.symbol}` },
-                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${shortSymbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${shortSymbol}:${shortName}` },
                 ],
                 [
                   { text: '📊 Details', callback_data: `details:${analysis.token.contractAddress}` },
+                  { text: '📋 Copy CA', callback_data: `copy:${analysis.token.contractAddress}` },
                 ],
               ],
             };
@@ -373,11 +385,13 @@ ${this.getPotentialText(analysis)}
       const updateMessage = `
 🔍 *Scanning in Progress...*
 
-Tokens scanned: ${stats.tokensScanned}
+Total scans: ${stats.tokensScanned}
+Unique tokens: ${stats.uniqueTokensScanned}
 Alerts triggered: ${stats.alertsTriggered}
 Last scan: ${new Date(stats.lastScanTime).toLocaleTimeString()}
 
 Status: Active 🟢
+⏭️ Skipping duplicates automatically
       `;
 
       // Send update to all active hunters
@@ -547,7 +561,7 @@ Ready to hunt some runners! 🚀
       const stats = tokenScanner.getStats();
       await this.bot.sendMessage(
         chatId,
-        `📊 *Scanner Status*\n\nTokens scanned: ${stats.tokensScanned}\nAlerts triggered: ${stats.alertsTriggered}\nStatus: 🟢 Active\n\n👀 Watching the blockchain...`,
+        `📊 *Scanner Status*\n\nTokens scanned: ${stats.tokensScanned}\nUnique tokens: ${stats.uniqueTokensScanned}\nAlerts triggered: ${stats.alertsTriggered}\nStatus: 🟢 Active\n\n👀 Watching launchpads for new opportunities...`,
         { parse_mode: 'Markdown' }
       );
 
@@ -581,9 +595,11 @@ Ready to hunt some runners! 🚀
 🛑 *Hunt mode stopped*
 
 Session Summary:
-• Tokens scanned: ${stats.tokensScanned}
+• Total scans: ${stats.tokensScanned}
+• Unique tokens: ${stats.uniqueTokensScanned}
 • Alerts sent: ${stats.alertsTriggered}
 
+✅ No duplicates were scanned
 Use /hunt to start hunting again!
       `;
 
@@ -609,46 +625,63 @@ Use /hunt to start hunting again!
   }
 
   private async analyzeAndRespond(chatId: number, contractAddress: string): Promise<void> {
-    await this.bot.sendMessage(chatId, '🔍 Analyzing token... This may take a moment.');
+    try {
+      await this.bot.sendMessage(chatId, '🔍 Analyzing token... This may take a moment.');
 
-    const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
+      const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
 
-    if (!analysis) {
-      await this.bot.sendMessage(chatId, '❌ Failed to analyze token. Make sure the contract address is valid.');
-      return;
+      if (!analysis) {
+        await this.bot.sendMessage(chatId, '❌ Failed to analyze token. Make sure the contract address is valid.');
+        return;
+      }
+
+      const message = this.formatAnalysis(analysis);
+      await this.bot.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      });
+
+      // Show action buttons
+      const userId = chatId; // For now, assume chatId = userId
+      const isFav = db.isFavorite(userId, contractAddress);
+
+      // Shorten symbol and name to avoid exceeding 64-byte callback limit
+      const shortSymbol = analysis.token.symbol.substring(0, 10);
+      const shortName = analysis.token.name.substring(0, 15);
+
+      // Build keyboard with action buttons
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '💰 Buy', callback_data: `buy:${contractAddress}` },
+            { text: '💸 Sell', callback_data: `sell:${contractAddress}` },
+          ],
+          [
+            { text: '🎯 Set TP', callback_data: `settp:${contractAddress}` },
+            { text: '🛡️ Set SL', callback_data: `setsl:${contractAddress}` },
+          ],
+          [
+            { text: '📊 Set DCA', callback_data: `setdca:${contractAddress}:${shortSymbol}` },
+            { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${contractAddress}` : `favorite:${contractAddress}:${shortSymbol}:${shortName}` },
+          ],
+          [
+            { text: '📊 Details', callback_data: `details:${contractAddress}` },
+            { text: '📋 Copy CA', callback_data: `copy:${contractAddress}` },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(
+        chatId,
+        'What would you like to do?',
+        { reply_markup: keyboard }
+      );
+
+      logger.info(`Successfully sent analysis and buttons for ${analysis.token.symbol}`);
+    } catch (error) {
+      logger.error('Error in analyzeAndRespond:', error);
+      throw error; // Re-throw to be caught by the outer handler
     }
-
-    const message = this.formatAnalysis(analysis);
-    await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-
-    // Show action buttons
-    const userId = chatId; // For now, assume chatId = userId
-    const isFav = db.isFavorite(userId, contractAddress);
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '💰 Buy', callback_data: `buy:${contractAddress}` },
-          { text: '💸 Sell', callback_data: `sell:${contractAddress}` },
-        ],
-        [
-          { text: '🎯 Set TP', callback_data: `settp:${contractAddress}` },
-          { text: '🛡️ Set SL', callback_data: `setsl:${contractAddress}` },
-        ],
-        [
-          { text: '📊 Set DCA', callback_data: `setdca:${contractAddress}:${analysis.token.symbol}` },
-          { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${contractAddress}` : `favorite:${contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
-        ],
-        [
-          { text: '📊 Details', callback_data: `details:${contractAddress}` },
-        ],
-      ],
-    };
-
-    await this.bot.sendMessage(
-      chatId,
-      'What would you like to do?',
-      { reply_markup: keyboard }
-    );
   }
 
   private async handleBuy(msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
@@ -1248,23 +1281,34 @@ Send SOL to this address:
       const address = walletManager.getWalletAddress(userId);
 
       const message = `
-🔑 *Your Private Key*
+🔑 *YOUR REAL SOLANA PRIVATE KEY*
 
 *Wallet Address:*
 \`${address}\`
 
-*Private Key:*
+*Private Key (Array Format):*
 \`${privateKeyString}\`
 
-⚠️ *SECURITY WARNING:*
-• Keep this private key secure
-• Never share it with anyone
-• Anyone with this key can access your funds
-• Delete this message after saving it
+*Base58 Format:*
+\`${Buffer.from(keypair.secretKey).toString('base64')}\`
+
+⚠️ *CRITICAL SECURITY WARNING:*
+• This is your ACTUAL private key - NOT a demo!
+• Keep this private key extremely secure
+• NEVER share it with anyone
+• Anyone with this key has COMPLETE access to your funds
+• Save it securely and DELETE this message immediately
+• You can import this key into Phantom, Solflare, or any Solana wallet
+
+💡 *How to Import:*
+1. Open your Solana wallet
+2. Select "Import Wallet"
+3. Paste the private key array above
+4. Your wallet will be imported with address: ${address}
       `;
 
       await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-      logger.info(`User ${userId} exported private key`);
+      logger.info(`User ${userId} exported REAL private key for address ${address}`);
     } catch (error) {
       logger.error('Error in exportPrivateKey:', error);
       await this.bot.sendMessage(chatId, '❌ Failed to export private key.');
@@ -1833,6 +1877,79 @@ Use /scan ${analysis.token.contractAddress} for full analysis
     }
   }
 
+  private async handlePaperTrades(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const userId = msg.from?.id || 0;
+      const chatId = msg.chat.id;
+
+      // Get all paper trades
+      const paperTrades = db.getAllPaperTrades(userId);
+
+      if (paperTrades.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          '📝 *Paper Trades*\n\nNo paper trades yet! Start /hunt mode to begin paper trading launchpad tokens.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Get stats
+      const stats = db.getPaperTradeStats(userId);
+
+      let message = '📝 *Paper Trade Portfolio*\n\n';
+      message += `📊 *Overall Stats:*\n`;
+      message += `Total Trades: ${stats.total_trades}\n`;
+      message += `Open: ${stats.open_trades} | Winners: ${stats.winners} | Losers: ${stats.losers}\n`;
+      message += `Win Rate: ${stats.total_trades > stats.open_trades ? ((stats.winners / (stats.total_trades - stats.open_trades)) * 100).toFixed(1) : 0}%\n`;
+      message += `Avg PnL: ${stats.avg_pnl_percentage ? stats.avg_pnl_percentage.toFixed(2) : 0}%\n`;
+      message += `Total PnL: ${stats.total_pnl ? stats.total_pnl.toFixed(4) : 0} SOL\n\n`;
+
+      // Show 2x+ winners first
+      const winners2x = paperTrades.filter(t => t.pnl_percentage >= 100);
+      if (winners2x.length > 0) {
+        message += `🎉 *2x+ Winners (${winners2x.length}):*\n`;
+        for (const trade of winners2x.slice(0, 5)) {
+          message += `• ${trade.symbol}: +${trade.pnl_percentage.toFixed(2)}%\n`;
+          message += `  Entry: $${trade.entry_price.toFixed(8)}\n`;
+          message += `  Current: $${trade.current_price.toFixed(8)}\n`;
+        }
+        message += '\n';
+      }
+
+      // Show recent open positions
+      const openPositions = paperTrades.filter(t => t.status === 'open').slice(0, 10);
+      if (openPositions.length > 0) {
+        message += `📊 *Open Positions (${openPositions.length}):*\n`;
+        for (const trade of openPositions.slice(0, 5)) {
+          const pnlEmoji = trade.pnl_percentage > 0 ? '🟢' : trade.pnl_percentage < 0 ? '🔴' : '⚪';
+          message += `${pnlEmoji} ${trade.symbol}: ${trade.pnl_percentage > 0 ? '+' : ''}${trade.pnl_percentage.toFixed(2)}%\n`;
+        }
+        message += '\n';
+      }
+
+      // Show recent closed positions
+      const closedPositions = paperTrades.filter(t => t.status === 'closed').slice(0, 5);
+      if (closedPositions.length > 0) {
+        message += `📖 *Recent Closed (${closedPositions.length}):*\n`;
+        for (const trade of closedPositions) {
+          const resultEmoji = trade.pnl > 0 ? '✅' : '❌';
+          message += `${resultEmoji} ${trade.symbol}: ${trade.pnl > 0 ? '+' : ''}${trade.pnl_percentage.toFixed(2)}%\n`;
+        }
+      }
+
+      message += '\n💡 *Bot Thesis:*\n';
+      message += 'Paper trading ALL launchpad tokens (PumpFun, Meteora, etc.) to learn patterns. ';
+      message += 'Tokens with 2x+ gains are analyzed to improve buy signal accuracy. ';
+      message += 'The more winners we collect, the better the strategy becomes! 🧠';
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handlePaperTrades:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
   async start(): Promise<void> {
     try {
       // Register bot commands with Telegram
@@ -1858,6 +1975,7 @@ Use /scan ${analysis.token.contractAddress} for full analysis
         { command: 'favorites', description: 'View your favorite tokens' },
         { command: 'dcaorders', description: 'View active DCA orders' },
         { command: 'tpslorders', description: 'View active TP/SL orders' },
+        { command: 'papertrades', description: 'View paper trade portfolio with thesis' },
       ]);
 
       logger.info('✅ Bot commands registered with Telegram');

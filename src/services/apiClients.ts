@@ -27,6 +27,44 @@ export class DexScreenerClient {
       return [];
     }
   }
+
+  /**
+   * Get new pairs from specific DEXs (launchpads)
+   */
+  async getNewPairs(): Promise<any[]> {
+    try {
+      const response = await axios.get(`${this.baseUrl}/pairs/solana`);
+      return response.data.pairs || [];
+    } catch (error) {
+      logger.error(`DexScreener new pairs error:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Filter pairs by DEX name (PumpFun, Raydium, Meteora, Orca, etc.)
+   */
+  filterByDex(pairs: any[], allowedDexes: string[]): any[] {
+    return pairs.filter(pair => {
+      const dexId = pair.dexId?.toLowerCase() || '';
+      return allowedDexes.some(allowed => dexId.includes(allowed.toLowerCase()));
+    });
+  }
+
+  /**
+   * Check if a pair is from a launchpad/new token platform
+   */
+  isFromLaunchpad(pair: any): boolean {
+    const dexId = pair.dexId?.toLowerCase() || '';
+    const launchpads = [
+      'pump',      // PumpFun
+      'meteora',   // Meteora
+      'raydium',   // Raydium (has launchpad)
+      'moonshot',  // Moonshot
+      'pump.fun',  // PumpFun alternative name
+    ];
+    return launchpads.some(lp => dexId.includes(lp));
+  }
 }
 
 export class BirdeyeClient {
