@@ -163,6 +163,11 @@ export class AlphaHunterBot {
         } else if (data.startsWith('details:')) {
           const contractAddress = data.substring(8);
           await this.handleDetailsCallback(chatId, contractAddress);
+        } else if (data.startsWith('copy:')) {
+          const contractAddress = data.substring(5);
+          await this.bot.sendMessage(chatId, `📋 Contract Address copied:\n\`${contractAddress}\``, {
+            parse_mode: 'Markdown'
+          });
         } else if (data === 'export_private_key') {
           await this.handleExportPrivateKeyCallback(chatId, query.from.id);
         } else if (data === 'setup_pin') {
@@ -181,6 +186,97 @@ export class AlphaHunterBot {
   }
 
   private setupAlerts(): void {
+    // Setup scan notifications to show tokens being scanned
+    tokenScanner.onScanNotify(async (tokenInfo: { address: string; name?: string; symbol?: string }) => {
+      for (const [chatId, isActive] of this.activeHunters.entries()) {
+        if (isActive) {
+          try {
+            // Get token info from DexScreener if not provided
+            let displayName = tokenInfo.symbol || 'Token';
+            let displayCA = tokenInfo.address;
+
+            // Format CA for display (first 8 and last 6 characters)
+            const shortCA = `${displayCA.substring(0, 8)}...${displayCA.substring(displayCA.length - 6)}`;
+
+            const scanMessage = `
+🔍 *Scanning Token*
+
+📝 **${displayName}**
+📋 CA: \`${displayCA}\`
+
+⏳ Analyzing...
+            `;
+
+            await this.bot.sendMessage(chatId, scanMessage, {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '📋 Copy CA', callback_data: `copy:${displayCA}` },
+                  ],
+                ]
+              }
+            });
+          } catch (error) {
+            logger.error(`Failed to send scan notification to chat ${chatId}:`, error);
+          }
+        }
+      }
+    });
+
+    // Setup buy signal notifications
+    tokenScanner.onBuySignal(async (analysis: AnalysisResult) => {
+      for (const [chatId, isActive] of this.activeHunters.entries()) {
+        if (isActive) {
+          try {
+            const buySignalMessage = `
+🚨 *BUY SIGNAL DETECTED!* 🚨
+
+💎 **${analysis.token.symbol}** - ${analysis.token.name}
+
+📊 Score: ${analysis.overallScore.toFixed(0)}/100
+🎯 Confidence: ${(analysis.confidence * 100).toFixed(0)}%
+💰 Price: $${analysis.token.price.toFixed(8)}
+
+${this.getPotentialText(analysis)}
+
+✅ Paper trade executed automatically!
+📈 Monitoring for profit opportunities...
+            `;
+
+            const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+            const keyboard = {
+              inline_keyboard: [
+                [
+                  { text: '💰 Buy Now', callback_data: `buy:${analysis.token.contractAddress}` },
+                  { text: '💸 Sell', callback_data: `sell:${analysis.token.contractAddress}` },
+                ],
+                [
+                  { text: '🎯 Set TP', callback_data: `settp:${analysis.token.contractAddress}` },
+                  { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
+                ],
+                [
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${analysis.token.symbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+                ],
+                [
+                  { text: '📊 Full Details', callback_data: `details:${analysis.token.contractAddress}` },
+                  { text: '📋 Copy CA', callback_data: `copy:${analysis.token.contractAddress}` },
+                ],
+              ],
+            };
+
+            await this.bot.sendMessage(chatId, buySignalMessage, {
+              parse_mode: 'Markdown',
+              reply_markup: keyboard
+            });
+          } catch (error) {
+            logger.error(`Failed to send buy signal to chat ${chatId}:`, error);
+          }
+        }
+      }
+    });
+
     tokenScanner.onAlert(async (analysis: AnalysisResult) => {
       // Send to all active hunters with animation
       for (const [chatId, isActive] of this.activeHunters.entries()) {
@@ -438,9 +534,12 @@ Ready to hunt some runners! 🚀
         tokenScanner.start();
       }
 
+      // Start automated paper trading
+      tokenScanner.startAutomatedPaperTrading();
+
       await this.sleep(1000);
       await this.bot.editMessageText(
-        '✅ *Hunt Mode Active!*\n\n🎯 Scanner is now live and monitoring the blockchain\n\nYou\'ll receive:\n• 🔔 Real-time token alerts\n• 📊 Detailed analysis\n• 🚨 High-confidence opportunities\n\nUse /stop to deactivate',
+        '✅ *Hunt Mode Active!*\n\n🎯 Scanner is now live and monitoring the blockchain\n🤖 Automated paper trading enabled (every 2 min)\n\nYou\'ll receive:\n• 🔔 Real-time token alerts\n• 📊 Detailed analysis\n• 🚨 Buy signals for good tokens\n• 📈 Paper trade updates\n\nUse /stop to deactivate',
         { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
       );
 
@@ -474,6 +573,7 @@ Ready to hunt some runners! 🚀
       const anyActive = Array.from(this.activeHunters.values()).some(active => active);
       if (!anyActive) {
         tokenScanner.stop();
+        tokenScanner.stopAutomatedPaperTrading();
       }
 
       const stats = tokenScanner.getStats();
@@ -1588,6 +1688,11 @@ Send SOL to this address:
     }
 
     return { text: 'Low potential, better opportunities exist', emoji: '😐' };
+  }
+
+  private getPotentialText(analysis: AnalysisResult): string {
+    const potential = this.predictPotential(analysis);
+    return `🔮 ${potential.emoji} ${potential.text}`;
   }
 
   private formatAlert(analysis: AnalysisResult): string {
