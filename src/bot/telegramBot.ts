@@ -13,9 +13,27 @@ export class AlphaHunterBot {
 
   constructor() {
     this.bot = new TelegramBot(config.telegram.botToken, { polling: true });
+    this.setupErrorHandlers();
     this.setupCommands();
     this.setupMessageHandlers();
     this.setupAlerts();
+  }
+
+  private setupErrorHandlers(): void {
+    // Handle polling errors
+    this.bot.on('polling_error', (error) => {
+      logger.error('Telegram polling error:', error);
+    });
+
+    // Handle webhook errors
+    this.bot.on('webhook_error', (error) => {
+      logger.error('Telegram webhook error:', error);
+    });
+
+    // Handle general errors
+    this.bot.on('error', (error) => {
+      logger.error('Telegram bot error:', error);
+    });
   }
 
   private setupCommands(): void {
@@ -41,12 +59,24 @@ export class AlphaHunterBot {
   private setupMessageHandlers(): void {
     // Handle contract addresses pasted directly
     this.bot.on('message', async (msg) => {
-      if (msg.text && !msg.text.startsWith('/')) {
-        const text = msg.text.trim();
+      try {
+        if (msg.text && !msg.text.startsWith('/')) {
+          const text = msg.text.trim();
 
-        // Check if it looks like a Solana contract address (32-44 characters, alphanumeric)
-        if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
-          await this.analyzeAndRespond(msg.chat.id, text);
+          logger.info(`Received message from user ${msg.from?.id}: ${text.substring(0, 50)}...`);
+
+          // Check if it looks like a Solana contract address (32-44 characters, alphanumeric)
+          if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+            logger.info('Detected contract address, analyzing...');
+            await this.analyzeAndRespond(msg.chat.id, text);
+          }
+        }
+      } catch (error) {
+        logger.error('Error in message handler:', error);
+        try {
+          await this.bot.sendMessage(msg.chat.id, '❌ An error occurred processing your message.');
+        } catch (sendError) {
+          logger.error('Failed to send error message:', sendError);
         }
       }
     });
@@ -65,13 +95,16 @@ export class AlphaHunterBot {
   }
 
   private async handleStart(msg: TelegramBot.Message): Promise<void> {
-    const chatId = msg.chat.id;
-    const userId = msg.from?.id || 0;
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
 
-    // Create user if not exists
-    db.createUser(userId);
+      logger.info(`User ${userId} sent /start command`);
 
-    const welcome = `
+      // Create user if not exists
+      db.createUser(userId);
+
+      const welcome = `
 🎯 **Welcome to Alpha Hunter!**
 
 I'm your AI-powered Solana runner detection system. Here's what I can do:
@@ -97,13 +130,25 @@ I'm your AI-powered Solana runner detection system. Here's what I can do:
 • /learning → AI learning report
 
 Type /help for more info or paste a contract address to start!
-    `;
+      `;
 
-    await this.bot.sendMessage(chatId, welcome, { parse_mode: 'Markdown' });
+      await this.bot.sendMessage(chatId, welcome, { parse_mode: 'Markdown' });
+      logger.info(`Successfully sent welcome message to user ${userId}`);
+    } catch (error) {
+      logger.error('Error in handleStart:', error);
+      try {
+        await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
+      } catch (sendError) {
+        logger.error('Failed to send error message:', sendError);
+      }
+    }
   }
 
   private async handleHelp(msg: TelegramBot.Message): Promise<void> {
-    const help = `
+    try {
+      logger.info(`User ${msg.from?.id} requested help`);
+
+      const help = `
 📚 **Alpha Hunter Commands**
 
 **Analysis:**
@@ -135,9 +180,17 @@ Type /help for more info or paste a contract address to start!
 • /learning → AI learning stats
 
 Ready to hunt some runners! 🚀
-    `;
+      `;
 
-    await this.bot.sendMessage(msg.chat.id, help, { parse_mode: 'Markdown' });
+      await this.bot.sendMessage(msg.chat.id, help, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleHelp:', error);
+      try {
+        await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
+      } catch (sendError) {
+        logger.error('Failed to send error message:', sendError);
+      }
+    }
   }
 
   private async handleHunt(msg: TelegramBot.Message): Promise<void> {
@@ -457,9 +510,33 @@ Use /scan ${analysis.token.contractAddress} for full analysis
     `;
   }
 
-  start(): void {
-    logger.info('🤖 Telegram bot started');
-    logger.info('🚀 Alpha Hunter is online and ready to respond to messages!');
+  async start(): Promise<void> {
+    try {
+      // Register bot commands with Telegram
+      await this.bot.setMyCommands([
+        { command: 'start', description: 'Start the bot and see welcome message' },
+        { command: 'help', description: 'Show all available commands' },
+        { command: 'hunt', description: 'Start hunting for runners' },
+        { command: 'stop', description: 'Stop hunting' },
+        { command: 'scan', description: 'Analyze a specific token' },
+        { command: 'buy', description: 'Buy a token' },
+        { command: 'sell', description: 'Close a position' },
+        { command: 'portfolio', description: 'View your positions' },
+        { command: 'preset', description: 'View or change trading preset' },
+        { command: 'settings', description: 'View your settings' },
+        { command: 'patterns', description: 'View pattern performance' },
+        { command: 'learning', description: 'View AI learning report' },
+        { command: 'autotrade', description: 'Toggle auto-trading' },
+        { command: 'papermode', description: 'Toggle paper trading' },
+      ]);
+
+      logger.info('✅ Bot commands registered with Telegram');
+      logger.info('🤖 Telegram bot started');
+      logger.info('🚀 Alpha Hunter is online and ready to respond to messages!');
+    } catch (error) {
+      logger.error('Error registering bot commands:', error);
+      logger.info('🤖 Telegram bot started (commands registration failed)');
+    }
   }
 }
 
