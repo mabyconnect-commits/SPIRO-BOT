@@ -9,9 +9,19 @@ import walletManager from '../services/walletManager';
 import logger from '../utils/logger';
 import { AnalysisResult } from '../types';
 
+interface PendingAction {
+  action: string;
+  contractAddress?: string;
+  symbol?: string;
+  name?: string;
+  data?: any;
+}
+
 export class AlphaHunterBot {
   private bot: TelegramBot;
   private activeHunters: Map<number, boolean> = new Map(); // Track users who have hunt mode active
+  private pendingPinSetup: Map<number, { privateKey: string; action: string }> = new Map(); // Track pending PIN setups
+  private pendingActions: Map<number, PendingAction> = new Map(); // Track pending user actions (TP, SL, DCA setup)
 
   constructor() {
     this.bot = new TelegramBot(config.telegram.botToken, { polling: true });
@@ -62,6 +72,11 @@ export class AlphaHunterBot {
     this.bot.onText(/\/balance/, this.handleBalance.bind(this));
     this.bot.onText(/\/deposit/, this.handleDeposit.bind(this));
 
+    // Favorites and DCA commands
+    this.bot.onText(/\/favorites/, this.handleFavorites.bind(this));
+    this.bot.onText(/\/dcaorders/, this.handleDCAOrders.bind(this));
+    this.bot.onText(/\/tpslorders/, this.handleTPSLOrders.bind(this));
+
     logger.info('Telegram bot commands registered');
   }
 
@@ -71,8 +86,27 @@ export class AlphaHunterBot {
       try {
         if (msg.text && !msg.text.startsWith('/')) {
           const text = msg.text.trim();
+          const userId = msg.from?.id || 0;
 
-          logger.info(`Received message from user ${msg.from?.id}: ${text.substring(0, 50)}...`);
+          logger.info(`Received message from user ${userId}: ${text.substring(0, 50)}...`);
+
+          // Check if user is setting up a PIN
+          if (this.pendingPinSetup.has(userId)) {
+            // Validate PIN (4 digits)
+            if (/^\d{4}$/.test(text)) {
+              await this.handlePinSetup(msg.chat.id, userId, text);
+              return;
+            } else {
+              await this.bot.sendMessage(msg.chat.id, '❌ Invalid PIN. Please enter exactly 4 digits.');
+              return;
+            }
+          }
+
+          // Check if user has pending actions (TP, SL, DCA setup)
+          if (this.pendingActions.has(userId)) {
+            await this.handlePendingAction(msg.chat.id, userId, text);
+            return;
+          }
 
           // Check if it looks like a Solana contract address (32-44 characters, alphanumeric)
           if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
@@ -103,9 +137,36 @@ export class AlphaHunterBot {
         if (data.startsWith('buy:')) {
           const contractAddress = data.substring(4);
           await this.handleBuyCallback(chatId, contractAddress, query.from.id);
+        } else if (data.startsWith('sell:')) {
+          const contractAddress = data.substring(5);
+          await this.handleSellCallback(chatId, contractAddress, query.from.id);
+        } else if (data.startsWith('settp:')) {
+          const contractAddress = data.substring(6);
+          await this.handleSetTPCallback(chatId, contractAddress, query.from.id);
+        } else if (data.startsWith('setsl:')) {
+          const contractAddress = data.substring(6);
+          await this.handleSetSLCallback(chatId, contractAddress, query.from.id);
+        } else if (data.startsWith('setdca:')) {
+          const parts = data.substring(7).split(':');
+          const contractAddress = parts[0];
+          const symbol = parts[1] || '';
+          await this.handleSetDCACallback(chatId, contractAddress, symbol, query.from.id);
+        } else if (data.startsWith('favorite:')) {
+          const parts = data.substring(9).split(':');
+          const contractAddress = parts[0];
+          const symbol = parts[1] || '';
+          const name = parts[2] || '';
+          await this.handleFavoriteCallback(chatId, contractAddress, symbol, name, query.from.id);
+        } else if (data.startsWith('unfavorite:')) {
+          const contractAddress = data.substring(11);
+          await this.handleUnfavoriteCallback(chatId, contractAddress, query.from.id);
         } else if (data.startsWith('details:')) {
           const contractAddress = data.substring(8);
           await this.handleDetailsCallback(chatId, contractAddress);
+        } else if (data === 'export_private_key') {
+          await this.handleExportPrivateKeyCallback(chatId, query.from.id);
+        } else if (data === 'setup_pin') {
+          await this.handleSetupPinCallback(chatId, query.from.id);
         }
 
         // Answer the callback query to remove loading state
@@ -121,14 +182,77 @@ export class AlphaHunterBot {
 
   private setupAlerts(): void {
     tokenScanner.onAlert(async (analysis: AnalysisResult) => {
-      // Send alert to all users with notifications enabled
-      const message = this.formatAlert(analysis);
-
-      // Send to all active hunters
+      // Send to all active hunters with animation
       for (const [chatId, isActive] of this.activeHunters.entries()) {
         if (isActive) {
           try {
-            await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            // Animated token found notification
+            const alertMsg = await this.bot.sendMessage(
+              chatId,
+              '🎯 *Token Found!*\n\n⏳ Analyzing...',
+              { parse_mode: 'Markdown' }
+            );
+
+            await this.sleep(1500);
+            await this.bot.editMessageText(
+              '🎯 *Token Found!*\n\n🔍 Deep scanning...',
+              { chat_id: chatId, message_id: alertMsg.message_id, parse_mode: 'Markdown' }
+            );
+
+            await this.sleep(1500);
+            await this.bot.editMessageText(
+              '🎯 *Token Found!*\n\n📊 Calculating scores...',
+              { chat_id: chatId, message_id: alertMsg.message_id, parse_mode: 'Markdown' }
+            );
+
+            await this.sleep(1000);
+            await this.bot.editMessageText(
+              '✅ *Analysis Complete!*\n\nScroll down for details 👇',
+              { chat_id: chatId, message_id: alertMsg.message_id, parse_mode: 'Markdown' }
+            );
+
+            // Send the detailed analysis
+            const message = this.formatAnalysis(analysis);
+            await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'Markdown',
+              disable_web_page_preview: false
+            });
+
+            // Show action buttons
+            const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+            const keyboard = {
+              inline_keyboard: [
+                [
+                  { text: '💰 Buy', callback_data: `buy:${analysis.token.contractAddress}` },
+                  { text: '💸 Sell', callback_data: `sell:${analysis.token.contractAddress}` },
+                ],
+                [
+                  { text: '🎯 Set TP', callback_data: `settp:${analysis.token.contractAddress}` },
+                  { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
+                ],
+                [
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${analysis.token.symbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+                ],
+                [
+                  { text: '📊 Details', callback_data: `details:${analysis.token.contractAddress}` },
+                ],
+              ],
+            };
+
+            await this.bot.sendMessage(
+              chatId,
+              'What would you like to do?',
+              { reply_markup: keyboard }
+            );
+
+            // Send still hunting status
+            await this.bot.sendMessage(
+              chatId,
+              '🔍 *Still Hunting...*\n\nScanner is active and monitoring for more opportunities 👀',
+              { parse_mode: 'Markdown' }
+            );
+
           } catch (error) {
             logger.error(`Failed to send alert to chat ${chatId}:`, error);
           }
@@ -283,36 +407,60 @@ Ready to hunt some runners! 🚀
       // Add user to active hunters
       this.activeHunters.set(chatId, true);
 
+      // Send animated hunting start
+      const huntingMsg = await this.bot.sendMessage(
+        chatId,
+        '🔍 *Hunting...*\n\n⏳ Initializing scanner...',
+        { parse_mode: 'Markdown' }
+      );
+
+      // Animate the hunting process
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '🔍 *Hunting...*\n\n🌐 Connecting to blockchain...',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
+      );
+
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '🔍 *Hunting...*\n\n📡 Scanning liquidity pools...',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
+      );
+
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '🔍 *Hunting...*\n\n🎯 Analyzing patterns...',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
+      );
+
       // Start scanner if not already running
       if (!tokenScanner.isActive()) {
         tokenScanner.start();
       }
 
-      await this.bot.sendMessage(
-        chatId,
-        '🔍 *Hunt mode activated!*\n\nScanning for runners... I\'ll send you:\n• Real-time token discoveries\n• High-confidence alerts\n• Scanning progress updates\n\nUse /stop to deactivate 🎯',
-        { parse_mode: 'Markdown' }
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '✅ *Hunt Mode Active!*\n\n🎯 Scanner is now live and monitoring the blockchain\n\nYou\'ll receive:\n• 🔔 Real-time token alerts\n• 📊 Detailed analysis\n• 🚨 High-confidence opportunities\n\nUse /stop to deactivate',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
       );
 
       // Send initial scanning status
       const stats = tokenScanner.getStats();
-      const statusMessage = `
-📊 *Current Scanning Status*
-
-Tokens scanned today: ${stats.tokensScanned}
-Alerts triggered: ${stats.alertsTriggered}
-Scanner: Active 🟢
-
-I'm watching the blockchain for you! 👀
-      `;
-
-      await this.bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+      await this.bot.sendMessage(
+        chatId,
+        `📊 *Scanner Status*\n\nTokens scanned: ${stats.tokensScanned}\nAlerts triggered: ${stats.alertsTriggered}\nStatus: 🟢 Active\n\n👀 Watching the blockchain...`,
+        { parse_mode: 'Markdown' }
+      );
 
       logger.info(`User ${msg.from?.id} activated hunt mode`);
     } catch (error) {
       logger.error('Error in handleHunt:', error);
       await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
     }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   private async handleStop(msg: TelegramBot.Message): Promise<void> {
@@ -374,10 +522,23 @@ Use /hunt to start hunting again!
     await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 
     // Show action buttons
+    const userId = chatId; // For now, assume chatId = userId
+    const isFav = db.isFavorite(userId, contractAddress);
     const keyboard = {
       inline_keyboard: [
         [
           { text: '💰 Buy', callback_data: `buy:${contractAddress}` },
+          { text: '💸 Sell', callback_data: `sell:${contractAddress}` },
+        ],
+        [
+          { text: '🎯 Set TP', callback_data: `settp:${contractAddress}` },
+          { text: '🛡️ Set SL', callback_data: `setsl:${contractAddress}` },
+        ],
+        [
+          { text: '📊 Set DCA', callback_data: `setdca:${contractAddress}:${analysis.token.symbol}` },
+          { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${contractAddress}` : `favorite:${contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+        ],
+        [
           { text: '📊 Details', callback_data: `details:${contractAddress}` },
         ],
       ],
@@ -755,24 +916,53 @@ Use /balance to refresh balance
         return;
       }
 
+      // Get the private key
+      const keypair = walletManager.getKeypair(userId);
+      if (!keypair) {
+        throw new Error('Failed to retrieve wallet keypair');
+      }
+
+      const privateKeyArray = Array.from(keypair.secretKey);
+      const privateKeyString = JSON.stringify(privateKeyArray);
+
       const message = `
 ✅ *Wallet Created Successfully!*
 
-*Your Address:*
+*Public Address:*
 \`${result.publicKey}\`
 
-🔒 Your private key is encrypted and stored securely.
+🔑 *Private Key:*
+\`${privateKeyString}\`
+
+⚠️ *IMPORTANT SECURITY NOTICE:*
+• Save your private key in a secure location
+• Never share your private key with anyone
+• You need this to recover your wallet
+• Delete this message after saving
 
 *Next Steps:*
-1. Use /deposit to get deposit instructions
-2. Fund your wallet with SOL
-3. Turn off paper trading: /papermode off
-4. Start trading with real funds!
-
-⚠️ *Important:* Keep your wallet funded to execute trades. Minimum recommended: 0.1 SOL
+1. Save your private key securely
+2. Set up a 4-digit PIN for protection (recommended)
+3. Fund your wallet with SOL
+4. Start trading!
       `;
 
       await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+
+      // Add buttons for PIN setup and export
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '🔐 Set up PIN Protection', callback_data: 'setup_pin' }],
+          [{ text: '📥 Export Private Key', callback_data: 'export_private_key' }],
+        ],
+      };
+
+      await this.bot.sendMessage(
+        chatId,
+        'Would you like to set up additional security?',
+        { reply_markup: keyboard }
+      );
+
       logger.info(`Created wallet for user ${userId}: ${result.publicKey}`);
     } catch (error) {
       logger.error('Error in handleCreateWallet:', error);
@@ -861,8 +1051,407 @@ Send SOL to this address:
     }
   }
 
+  private async handleSetupPinCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      if (!walletManager.hasWallet(userId)) {
+        await this.bot.sendMessage(chatId, '❌ You need a wallet first. Use /createwallet');
+        return;
+      }
+
+      await this.bot.sendMessage(
+        chatId,
+        '🔐 *Set up PIN Protection*\n\nPlease enter a 4-digit PIN to protect your private key:\n\n⚠️ Remember this PIN - you\'ll need it to export your private key later.',
+        { parse_mode: 'Markdown' }
+      );
+
+      this.pendingPinSetup.set(userId, { privateKey: '', action: 'setup' });
+    } catch (error) {
+      logger.error('Error in handleSetupPinCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleExportPrivateKeyCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      if (!walletManager.hasWallet(userId)) {
+        await this.bot.sendMessage(chatId, '❌ You need a wallet first. Use /createwallet');
+        return;
+      }
+
+      // Check if PIN is set
+      const pinHash = db.getPinHash(userId);
+      if (pinHash) {
+        await this.bot.sendMessage(
+          chatId,
+          '🔐 *Enter Your PIN*\n\nPlease enter your 4-digit PIN to export your private key:',
+          { parse_mode: 'Markdown' }
+        );
+        this.pendingPinSetup.set(userId, { privateKey: '', action: 'export' });
+      } else {
+        // No PIN set, export directly
+        await this.exportPrivateKey(chatId, userId);
+      }
+    } catch (error) {
+      logger.error('Error in handleExportPrivateKeyCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handlePinSetup(chatId: number, userId: number, pin: string): Promise<void> {
+    try {
+      const pending = this.pendingPinSetup.get(userId);
+      if (!pending) return;
+
+      if (pending.action === 'setup') {
+        // Save PIN hash
+        const crypto = require('crypto');
+        const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
+        db.setPinHash(userId, pinHash);
+
+        await this.bot.sendMessage(
+          chatId,
+          '✅ *PIN Set Successfully!*\n\nYour private key is now protected. Use the Export button to access it with your PIN.',
+          { parse_mode: 'Markdown' }
+        );
+
+        this.pendingPinSetup.delete(userId);
+      } else if (pending.action === 'export') {
+        // Verify PIN
+        const crypto = require('crypto');
+        const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
+        const storedHash = db.getPinHash(userId);
+
+        if (pinHash === storedHash) {
+          await this.exportPrivateKey(chatId, userId);
+          this.pendingPinSetup.delete(userId);
+        } else {
+          await this.bot.sendMessage(chatId, '❌ Incorrect PIN. Please try again.');
+        }
+      }
+    } catch (error) {
+      logger.error('Error in handlePinSetup:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+      this.pendingPinSetup.delete(userId);
+    }
+  }
+
+  private async exportPrivateKey(chatId: number, userId: number): Promise<void> {
+    try {
+      const keypair = walletManager.getKeypair(userId);
+      if (!keypair) {
+        await this.bot.sendMessage(chatId, '❌ Failed to retrieve private key.');
+        return;
+      }
+
+      const privateKeyArray = Array.from(keypair.secretKey);
+      const privateKeyString = JSON.stringify(privateKeyArray);
+      const address = walletManager.getWalletAddress(userId);
+
+      const message = `
+🔑 *Your Private Key*
+
+*Wallet Address:*
+\`${address}\`
+
+*Private Key:*
+\`${privateKeyString}\`
+
+⚠️ *SECURITY WARNING:*
+• Keep this private key secure
+• Never share it with anyone
+• Anyone with this key can access your funds
+• Delete this message after saving it
+      `;
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+      logger.info(`User ${userId} exported private key`);
+    } catch (error) {
+      logger.error('Error in exportPrivateKey:', error);
+      await this.bot.sendMessage(chatId, '❌ Failed to export private key.');
+    }
+  }
+
+  private async handleSellCallback(chatId: number, contractAddress: string, userId: number): Promise<void> {
+    try {
+      // Find open positions for this token
+      const positions = db.getOpenPositions(userId);
+      const position = positions.find(p => p.contractAddress === contractAddress);
+
+      if (!position) {
+        await this.bot.sendMessage(chatId, '❌ You don\'t have an open position for this token.');
+        return;
+      }
+
+      await this.bot.sendMessage(chatId, '🔄 Updating position and executing sell...');
+
+      // Update position with current price
+      await tradingEngine.updatePosition(position);
+
+      // Sell the position
+      const success = await tradingEngine.sell(position, position.type === 'paper');
+
+      if (success) {
+        const pnlEmoji = position.pnl > 0 ? '🟢' : '🔴';
+        await this.bot.sendMessage(
+          chatId,
+          `✅ *Position Closed!*\n\n` +
+          `${position.symbol}\n` +
+          `${pnlEmoji} PnL: ${position.pnl.toFixed(4)} SOL (${position.pnlPercentage.toFixed(2)}%)`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await this.bot.sendMessage(chatId, '❌ Failed to close position.');
+      }
+    } catch (error) {
+      logger.error('Error in handleSellCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred while selling.');
+    }
+  }
+
+  private async handleSetTPCallback(chatId: number, contractAddress: string, userId: number): Promise<void> {
+    try {
+      // Check if user has an open position for this token
+      const positions = db.getOpenPositions(userId);
+      const position = positions.find(p => p.contractAddress === contractAddress);
+
+      if (!position) {
+        await this.bot.sendMessage(
+          chatId,
+          '⚠️ You don\'t have an open position for this token yet.\n\nBuy the token first, then set Take Profit.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      await this.bot.sendMessage(
+        chatId,
+        '🎯 *Set Take Profit*\n\nEnter the percentage gain you want to take profit at (e.g., "50" for +50%):\n\nExample: If you enter 50, your position will automatically close when it reaches +50% profit.',
+        { parse_mode: 'Markdown' }
+      );
+
+      this.pendingActions.set(userId, {
+        action: 'set_tp',
+        contractAddress,
+        data: { positionId: position.id, entryPrice: position.entryPrice }
+      });
+    } catch (error) {
+      logger.error('Error in handleSetTPCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleSetSLCallback(chatId: number, contractAddress: string, userId: number): Promise<void> {
+    try {
+      // Check if user has an open position for this token
+      const positions = db.getOpenPositions(userId);
+      const position = positions.find(p => p.contractAddress === contractAddress);
+
+      if (!position) {
+        await this.bot.sendMessage(
+          chatId,
+          '⚠️ You don\'t have an open position for this token yet.\n\nBuy the token first, then set Stop Loss.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      await this.bot.sendMessage(
+        chatId,
+        '🛡️ *Set Stop Loss*\n\nEnter the percentage loss you want to stop at (e.g., "10" for -10%):\n\nExample: If you enter 10, your position will automatically close if it drops to -10% loss.',
+        { parse_mode: 'Markdown' }
+      );
+
+      this.pendingActions.set(userId, {
+        action: 'set_sl',
+        contractAddress,
+        data: { positionId: position.id, entryPrice: position.entryPrice }
+      });
+    } catch (error) {
+      logger.error('Error in handleSetSLCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleSetDCACallback(chatId: number, contractAddress: string, symbol: string, userId: number): Promise<void> {
+    try {
+      await this.bot.sendMessage(
+        chatId,
+        '📊 *Set Up Dollar Cost Averaging*\n\n' +
+        'DCA will automatically buy this token at regular intervals.\n\n' +
+        'Send your DCA settings in this format:\n' +
+        '`amount frequency executions`\n\n' +
+        'Example: `0.1 60 10`\n' +
+        '• Amount: 0.1 SOL per buy\n' +
+        '• Frequency: Every 60 minutes\n' +
+        '• Executions: 10 total buys\n\n' +
+        'This will invest 1 SOL total (0.1 × 10) over ~10 hours.',
+        { parse_mode: 'Markdown' }
+      );
+
+      this.pendingActions.set(userId, {
+        action: 'set_dca',
+        contractAddress,
+        symbol
+      });
+    } catch (error) {
+      logger.error('Error in handleSetDCACallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleFavoriteCallback(chatId: number, contractAddress: string, symbol: string, name: string, userId: number): Promise<void> {
+    try {
+      db.addFavorite(userId, contractAddress, symbol, name);
+      await this.bot.sendMessage(
+        chatId,
+        `⭐ *Added to Favorites!*\n\n${symbol} has been added to your favorites list.\n\nUse /favorites to view all your favorite tokens.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      logger.error('Error in handleFavoriteCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleUnfavoriteCallback(chatId: number, contractAddress: string, userId: number): Promise<void> {
+    try {
+      db.removeFavorite(userId, contractAddress);
+      await this.bot.sendMessage(
+        chatId,
+        '✅ Removed from favorites.',
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      logger.error('Error in handleUnfavoriteCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handlePendingAction(chatId: number, userId: number, text: string): Promise<void> {
+    try {
+      const pending = this.pendingActions.get(userId);
+      if (!pending) return;
+
+      if (pending.action === 'set_tp') {
+        const percentage = parseFloat(text);
+        if (isNaN(percentage) || percentage <= 0) {
+          await this.bot.sendMessage(chatId, '❌ Invalid percentage. Please enter a positive number (e.g., 50 for +50%).');
+          return;
+        }
+
+        const { positionId, entryPrice } = pending.data;
+        const triggerPrice = entryPrice * (1 + percentage / 100);
+
+        db.createTPSLOrder(
+          userId,
+          positionId,
+          pending.contractAddress!,
+          'tp',
+          triggerPrice,
+          percentage
+        );
+
+        await this.bot.sendMessage(
+          chatId,
+          `✅ *Take Profit Set!*\n\n` +
+          `Trigger: +${percentage}%\n` +
+          `Price: $${triggerPrice.toFixed(8)}\n\n` +
+          `Your position will automatically close when it reaches this profit level.`,
+          { parse_mode: 'Markdown' }
+        );
+
+        this.pendingActions.delete(userId);
+      } else if (pending.action === 'set_sl') {
+        const percentage = parseFloat(text);
+        if (isNaN(percentage) || percentage <= 0) {
+          await this.bot.sendMessage(chatId, '❌ Invalid percentage. Please enter a positive number (e.g., 10 for -10%).');
+          return;
+        }
+
+        const { positionId, entryPrice } = pending.data;
+        const triggerPrice = entryPrice * (1 - percentage / 100);
+
+        db.createTPSLOrder(
+          userId,
+          positionId,
+          pending.contractAddress!,
+          'sl',
+          triggerPrice,
+          -percentage
+        );
+
+        await this.bot.sendMessage(
+          chatId,
+          `✅ *Stop Loss Set!*\n\n` +
+          `Trigger: -${percentage}%\n` +
+          `Price: $${triggerPrice.toFixed(8)}\n\n` +
+          `Your position will automatically close if it drops to this loss level.`,
+          { parse_mode: 'Markdown' }
+        );
+
+        this.pendingActions.delete(userId);
+      } else if (pending.action === 'set_dca') {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length !== 3) {
+          await this.bot.sendMessage(
+            chatId,
+            '❌ Invalid format. Please use: `amount frequency executions`\n\nExample: `0.1 60 10`',
+            { parse_mode: 'Markdown' }
+          );
+          return;
+        }
+
+        const solAmount = parseFloat(parts[0]);
+        const frequencyMinutes = parseInt(parts[1]);
+        const totalExecutions = parseInt(parts[2]);
+
+        if (isNaN(solAmount) || isNaN(frequencyMinutes) || isNaN(totalExecutions)) {
+          await this.bot.sendMessage(chatId, '❌ Invalid numbers. Please check your input.');
+          return;
+        }
+
+        if (solAmount <= 0 || frequencyMinutes <= 0 || totalExecutions <= 0) {
+          await this.bot.sendMessage(chatId, '❌ All values must be positive.');
+          return;
+        }
+
+        const orderId = db.createDCAOrder(
+          userId,
+          pending.contractAddress!,
+          pending.symbol!,
+          solAmount,
+          frequencyMinutes,
+          totalExecutions
+        );
+
+        const totalInvestment = solAmount * totalExecutions;
+        const durationHours = (frequencyMinutes * totalExecutions) / 60;
+
+        await this.bot.sendMessage(
+          chatId,
+          `✅ *DCA Order Created!*\n\n` +
+          `Token: ${pending.symbol}\n` +
+          `Amount: ${solAmount} SOL per buy\n` +
+          `Frequency: Every ${frequencyMinutes} minutes\n` +
+          `Total Buys: ${totalExecutions}\n\n` +
+          `📊 Total Investment: ${totalInvestment} SOL\n` +
+          `⏱️ Duration: ~${durationHours.toFixed(1)} hours\n\n` +
+          `First buy will execute in ${frequencyMinutes} minutes.\n` +
+          `Use /dcaorders to manage your DCA orders.`,
+          { parse_mode: 'Markdown' }
+        );
+
+        this.pendingActions.delete(userId);
+      }
+    } catch (error) {
+      logger.error('Error in handlePendingAction:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+      this.pendingActions.delete(userId);
+    }
+  }
+
   private formatAnalysis(analysis: AnalysisResult): string {
-    const { token, overallScore, confidence, recommendation, matchedPatterns, reasoning } = analysis;
+    const { token, overallScore, confidence, recommendation, technical, fundamental } = analysis;
 
     const recEmoji = {
       strong_buy: '🚀',
@@ -871,10 +1460,134 @@ Send SOL to this address:
       avoid: '❌',
     };
 
-    let message = `${recEmoji[recommendation]} **${recommendation.toUpperCase().replace('_', ' ')}**\n\n`;
-    message += reasoning;
+    // Calculate rug probability
+    const rugProb = this.calculateRugProbability(analysis);
+    const potential = this.predictPotential(analysis);
+
+    let message = `${recEmoji[recommendation]} *${recommendation.toUpperCase().replace('_', ' ')}*\n\n`;
+    message += `*${token.symbol}* Analysis\n\n`;
+
+    // Price & Market Info
+    message += `💰 *Price:* $${token.price.toFixed(8)}\n`;
+    message += `📊 *Market Cap:* $${this.formatNumber(token.marketCap)}\n`;
+    message += `💧 *Liquidity:* $${this.formatNumber(token.liquidity)}\n`;
+    message += `📈 *24h Volume:* $${this.formatNumber(token.volume24h)}\n`;
+    message += `📉 *24h Change:* ${token.priceChange24h > 0 ? '📈' : '📉'} ${token.priceChange24h.toFixed(2)}%\n\n`;
+
+    // Pressure & Signals
+    message += `⚖️ *Buy/Sell Pressure:* ${this.getBuySellPressure(technical)}\n`;
+    message += `🎯 *Holder Concentration:* ${(fundamental.holderConcentration * 100).toFixed(1)}%\n`;
+    message += `👥 *Holders:* ${token.holders.toLocaleString()}\n\n`;
+
+    // Risk Analysis
+    message += `⚠️ *Rug Probability:* ${rugProb.emoji} ${rugProb.level} (${rugProb.percentage}%)\n`;
+    message += `🔐 *Liquidity Lock:* ${fundamental.liquidityLocked ? '✅ Locked' : '❌ Not Locked'}\n`;
+    message += `💼 *Dev Wallet:* ${fundamental.devWalletLocked ? '✅ Locked' : '⚠️ Unlocked'}\n\n`;
+
+    // Smart Money Analysis
+    if (analysis.walletSignals && analysis.walletSignals.length > 0) {
+      const smartMoney = analysis.walletSignals.filter(w => w.isSmartMoney || w.isWhale);
+      if (smartMoney.length > 0) {
+        message += `🧠 *Smart Money Activity:* ${smartMoney.length} detected\n`;
+        message += `${smartMoney.slice(0, 3).map(w => `  • ${w.isWhale ? '🐋' : '💎'} ${w.profitRate > 0 ? `+${w.profitRate.toFixed(0)}%` : 'New'}`).join('\n')}\n\n`;
+      }
+    }
+
+    // Prediction
+    message += `🔮 *Prediction:* ${potential.emoji} ${potential.text}\n`;
+    message += `📊 *Score:* ${overallScore.toFixed(0)}/100 (${(confidence * 100).toFixed(0)}% confident)\n\n`;
+
+    // Links
+    message += `🔗 *Links:*\n`;
+    message += `  • [DexScreener](https://dexscreener.com/solana/${token.contractAddress})\n`;
+    message += `  • [Birdeye](https://birdeye.so/token/${token.contractAddress})\n`;
+    message += `  • [Contract](https://solscan.io/token/${token.contractAddress})\n\n`;
+
+    // Reasoning
+    message += `💭 *Analysis:*\n${analysis.reasoning}`;
 
     return message;
+  }
+
+  private formatNumber(num: number): string {
+    if (num >= 1000000) return `${(num / 1000000).toFixed(2)}M`;
+    if (num >= 1000) return `${(num / 1000).toFixed(2)}K`;
+    return num.toFixed(2);
+  }
+
+  private getBuySellPressure(technical: any): string {
+    const ratio = technical.volumeBreakout ? 1.5 : 0.8;
+    if (ratio > 1.3) return '🟢 Strong Buy Pressure';
+    if (ratio > 1.0) return '🟡 Balanced';
+    return '🔴 Sell Pressure Dominates';
+  }
+
+  private calculateRugProbability(analysis: AnalysisResult): { level: string; percentage: number; emoji: string } {
+    let score = 0;
+
+    // Check liquidity lock
+    if (!analysis.fundamental.liquidityLocked) score += 30;
+
+    // Check dev wallet
+    if (!analysis.fundamental.devWalletLocked) score += 20;
+
+    // Check holder concentration
+    if (analysis.fundamental.holderConcentration > 0.5) score += 25;
+
+    // Check top holder percentage
+    if (analysis.fundamental.topHolderPercentage > 0.3) score += 15;
+
+    // Check token age
+    if (analysis.fundamental.tokenAge < 1) score += 10;
+
+    if (score < 20) return { level: 'Very Low', percentage: score, emoji: '🟢' };
+    if (score < 40) return { level: 'Low', percentage: score, emoji: '🟡' };
+    if (score < 60) return { level: 'Medium', percentage: score, emoji: '🟠' };
+    if (score < 80) return { level: 'High', percentage: score, emoji: '🔴' };
+    return { level: 'Very High', percentage: score, emoji: '🚨' };
+  }
+
+  private predictPotential(analysis: AnalysisResult): { text: string; emoji: string } {
+    const score = analysis.overallScore;
+    const confidence = analysis.confidence;
+    const technical = analysis.technical;
+    const fundamental = analysis.fundamental;
+
+    // Calculate potential multiplier
+    let multiplier = 1;
+
+    if (score > 80 && confidence > 0.8) multiplier = 10;
+    else if (score > 70 && confidence > 0.7) multiplier = 5;
+    else if (score > 60) multiplier = 3;
+    else if (score > 50) multiplier = 2;
+
+    // Check for warning signs
+    const rugProb = this.calculateRugProbability(analysis);
+    if (rugProb.percentage > 60) {
+      return { text: '⚠️ HIGH RUG RISK - Not recommended', emoji: '🚨' };
+    }
+
+    // Check for pump potential
+    if (technical.volumeBreakout && technical.priceAction === 'bullish' && fundamental.holderConcentration < 0.4) {
+      return { text: `Potential ${multiplier}x-${multiplier * 2}x pump incoming! 🚀`, emoji: '🚀' };
+    }
+
+    // Check for steady growth
+    if (score > 60 && fundamental.liquidityLocked && !technical.volumeBreakout) {
+      return { text: `Steady ${multiplier}x growth expected 📈`, emoji: '📈' };
+    }
+
+    // Quick spike potential
+    if (technical.volumeBreakout && score > 50) {
+      return { text: `Quick ${multiplier}x spike possible, watch closely! ⚡`, emoji: '⚡' };
+    }
+
+    // Conservative
+    if (score > 40) {
+      return { text: 'Moderate potential, proceed with caution', emoji: '⚖️' };
+    }
+
+    return { text: 'Low potential, better opportunities exist', emoji: '😐' };
   }
 
   private formatAlert(analysis: AnalysisResult): string {
@@ -889,6 +1602,130 @@ ${analysis.reasoning}
 
 Use /scan ${analysis.token.contractAddress} for full analysis
     `;
+  }
+
+  private async handleFavorites(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const userId = msg.from?.id || 0;
+      const chatId = msg.chat.id;
+
+      const favorites = db.getFavorites(userId);
+
+      if (favorites.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          '⭐ *Your Favorites*\n\nYou haven\'t added any tokens to favorites yet.\n\nAdd tokens to favorites by clicking the ⭐ button after analyzing them.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      let message = '⭐ *Your Favorite Tokens*\n\n';
+
+      for (const fav of favorites) {
+        message += `*${fav.symbol}* - ${fav.name}\n`;
+        message += `Contract: \`${fav.contractAddress}\`\n`;
+        message += `Added: ${new Date(fav.addedAt).toLocaleDateString()}\n\n`;
+      }
+
+      message += `Total: ${favorites.length} favorite${favorites.length !== 1 ? 's' : ''}\n\n`;
+      message += 'Paste any contract address to analyze it!';
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleFavorites:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  private async handleDCAOrders(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const userId = msg.from?.id || 0;
+      const chatId = msg.chat.id;
+
+      const orders = db.getActiveDCAOrders(userId);
+
+      if (orders.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          '📊 *DCA Orders*\n\nYou don\'t have any active DCA orders.\n\nSet up DCA orders by clicking the "Set DCA" button after analyzing a token.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      let message = '📊 *Active DCA Orders*\n\n';
+
+      for (const order of orders) {
+        const progress = `${order.executed_count}/${order.total_executions}`;
+        const totalInvested = order.sol_amount * order.executed_count;
+        const nextExec = new Date(order.next_execution);
+        const timeUntil = Math.max(0, Math.floor((nextExec.getTime() - Date.now()) / 60000));
+
+        message += `*${order.symbol}*\n`;
+        message += `Amount: ${order.sol_amount} SOL per buy\n`;
+        message += `Frequency: Every ${order.frequency_minutes} minutes\n`;
+        message += `Progress: ${progress} buys\n`;
+        message += `Invested: ${totalInvested.toFixed(2)} SOL\n`;
+        message += `Next buy: ${timeUntil < 60 ? `${timeUntil} minutes` : `${(timeUntil / 60).toFixed(1)} hours`}\n`;
+        message += `Order ID: ${order.id}\n\n`;
+      }
+
+      message += 'To cancel an order, use: /canceldca <order_id>';
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleDCAOrders:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  private async handleTPSLOrders(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const userId = msg.from?.id || 0;
+      const chatId = msg.chat.id;
+
+      const orders = db.getActiveTPSLOrders(userId);
+
+      if (orders.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          '🎯 *TP/SL Orders*\n\nYou don\'t have any active Take Profit or Stop Loss orders.\n\nSet them up by clicking "Set TP" or "Set SL" after buying a token.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      let message = '🎯 *Active TP/SL Orders*\n\n';
+
+      const tpOrders = orders.filter(o => o.order_type === 'tp');
+      const slOrders = orders.filter(o => o.order_type === 'sl');
+
+      if (tpOrders.length > 0) {
+        message += '*Take Profit Orders:*\n';
+        for (const order of tpOrders) {
+          message += `• ${order.trigger_percentage > 0 ? '+' : ''}${order.trigger_percentage.toFixed(1)}% @ $${order.trigger_price.toFixed(8)}\n`;
+          message += `  Position ID: ${order.position_id}\n`;
+        }
+        message += '\n';
+      }
+
+      if (slOrders.length > 0) {
+        message += '*Stop Loss Orders:*\n';
+        for (const order of slOrders) {
+          message += `• ${order.trigger_percentage.toFixed(1)}% @ $${order.trigger_price.toFixed(8)}\n`;
+          message += `  Position ID: ${order.position_id}\n`;
+        }
+        message += '\n';
+      }
+
+      message += `Total: ${orders.length} order${orders.length !== 1 ? 's' : ''}`;
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleTPSLOrders:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
   }
 
   async start(): Promise<void> {
@@ -913,6 +1750,9 @@ Use /scan ${analysis.token.contractAddress} for full analysis
         { command: 'createwallet', description: 'Create a new trading wallet' },
         { command: 'balance', description: 'Check your wallet balance' },
         { command: 'deposit', description: 'Get deposit instructions' },
+        { command: 'favorites', description: 'View your favorite tokens' },
+        { command: 'dcaorders', description: 'View active DCA orders' },
+        { command: 'tpslorders', description: 'View active TP/SL orders' },
       ]);
 
       logger.info('✅ Bot commands registered with Telegram');
