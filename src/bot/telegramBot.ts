@@ -12,6 +12,7 @@ import { AnalysisResult } from '../types';
 export class AlphaHunterBot {
   private bot: TelegramBot;
   private activeHunters: Map<number, boolean> = new Map(); // Track users who have hunt mode active
+  private pendingPinSetup: Map<number, { privateKey: string; action: string }> = new Map(); // Track pending PIN setups
 
   constructor() {
     this.bot = new TelegramBot(config.telegram.botToken, { polling: true });
@@ -71,8 +72,21 @@ export class AlphaHunterBot {
       try {
         if (msg.text && !msg.text.startsWith('/')) {
           const text = msg.text.trim();
+          const userId = msg.from?.id || 0;
 
-          logger.info(`Received message from user ${msg.from?.id}: ${text.substring(0, 50)}...`);
+          logger.info(`Received message from user ${userId}: ${text.substring(0, 50)}...`);
+
+          // Check if user is setting up a PIN
+          if (this.pendingPinSetup.has(userId)) {
+            // Validate PIN (4 digits)
+            if (/^\d{4}$/.test(text)) {
+              await this.handlePinSetup(msg.chat.id, userId, text);
+              return;
+            } else {
+              await this.bot.sendMessage(msg.chat.id, '❌ Invalid PIN. Please enter exactly 4 digits.');
+              return;
+            }
+          }
 
           // Check if it looks like a Solana contract address (32-44 characters, alphanumeric)
           if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
@@ -106,6 +120,10 @@ export class AlphaHunterBot {
         } else if (data.startsWith('details:')) {
           const contractAddress = data.substring(8);
           await this.handleDetailsCallback(chatId, contractAddress);
+        } else if (data === 'export_private_key') {
+          await this.handleExportPrivateKeyCallback(chatId, query.from.id);
+        } else if (data === 'setup_pin') {
+          await this.handleSetupPinCallback(chatId, query.from.id);
         }
 
         // Answer the callback query to remove loading state
@@ -121,14 +139,65 @@ export class AlphaHunterBot {
 
   private setupAlerts(): void {
     tokenScanner.onAlert(async (analysis: AnalysisResult) => {
-      // Send alert to all users with notifications enabled
-      const message = this.formatAlert(analysis);
-
-      // Send to all active hunters
+      // Send to all active hunters with animation
       for (const [chatId, isActive] of this.activeHunters.entries()) {
         if (isActive) {
           try {
-            await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            // Animated token found notification
+            const alertMsg = await this.bot.sendMessage(
+              chatId,
+              '🎯 *Token Found!*\n\n⏳ Analyzing...',
+              { parse_mode: 'Markdown' }
+            );
+
+            await this.sleep(1500);
+            await this.bot.editMessageText(
+              '🎯 *Token Found!*\n\n🔍 Deep scanning...',
+              { chat_id: chatId, message_id: alertMsg.message_id, parse_mode: 'Markdown' }
+            );
+
+            await this.sleep(1500);
+            await this.bot.editMessageText(
+              '🎯 *Token Found!*\n\n📊 Calculating scores...',
+              { chat_id: chatId, message_id: alertMsg.message_id, parse_mode: 'Markdown' }
+            );
+
+            await this.sleep(1000);
+            await this.bot.editMessageText(
+              '✅ *Analysis Complete!*\n\nScroll down for details 👇',
+              { chat_id: chatId, message_id: alertMsg.message_id, parse_mode: 'Markdown' }
+            );
+
+            // Send the detailed analysis
+            const message = this.formatAnalysis(analysis);
+            await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'Markdown',
+              disable_web_page_preview: false
+            });
+
+            // Show action buttons
+            const keyboard = {
+              inline_keyboard: [
+                [
+                  { text: '💰 Buy', callback_data: `buy:${analysis.token.contractAddress}` },
+                  { text: '📊 Details', callback_data: `details:${analysis.token.contractAddress}` },
+                ],
+              ],
+            };
+
+            await this.bot.sendMessage(
+              chatId,
+              'What would you like to do?',
+              { reply_markup: keyboard }
+            );
+
+            // Send still hunting status
+            await this.bot.sendMessage(
+              chatId,
+              '🔍 *Still Hunting...*\n\nScanner is active and monitoring for more opportunities 👀',
+              { parse_mode: 'Markdown' }
+            );
+
           } catch (error) {
             logger.error(`Failed to send alert to chat ${chatId}:`, error);
           }
@@ -283,36 +352,60 @@ Ready to hunt some runners! 🚀
       // Add user to active hunters
       this.activeHunters.set(chatId, true);
 
+      // Send animated hunting start
+      const huntingMsg = await this.bot.sendMessage(
+        chatId,
+        '🔍 *Hunting...*\n\n⏳ Initializing scanner...',
+        { parse_mode: 'Markdown' }
+      );
+
+      // Animate the hunting process
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '🔍 *Hunting...*\n\n🌐 Connecting to blockchain...',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
+      );
+
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '🔍 *Hunting...*\n\n📡 Scanning liquidity pools...',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
+      );
+
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '🔍 *Hunting...*\n\n🎯 Analyzing patterns...',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
+      );
+
       // Start scanner if not already running
       if (!tokenScanner.isActive()) {
         tokenScanner.start();
       }
 
-      await this.bot.sendMessage(
-        chatId,
-        '🔍 *Hunt mode activated!*\n\nScanning for runners... I\'ll send you:\n• Real-time token discoveries\n• High-confidence alerts\n• Scanning progress updates\n\nUse /stop to deactivate 🎯',
-        { parse_mode: 'Markdown' }
+      await this.sleep(1000);
+      await this.bot.editMessageText(
+        '✅ *Hunt Mode Active!*\n\n🎯 Scanner is now live and monitoring the blockchain\n\nYou\'ll receive:\n• 🔔 Real-time token alerts\n• 📊 Detailed analysis\n• 🚨 High-confidence opportunities\n\nUse /stop to deactivate',
+        { chat_id: chatId, message_id: huntingMsg.message_id, parse_mode: 'Markdown' }
       );
 
       // Send initial scanning status
       const stats = tokenScanner.getStats();
-      const statusMessage = `
-📊 *Current Scanning Status*
-
-Tokens scanned today: ${stats.tokensScanned}
-Alerts triggered: ${stats.alertsTriggered}
-Scanner: Active 🟢
-
-I'm watching the blockchain for you! 👀
-      `;
-
-      await this.bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+      await this.bot.sendMessage(
+        chatId,
+        `📊 *Scanner Status*\n\nTokens scanned: ${stats.tokensScanned}\nAlerts triggered: ${stats.alertsTriggered}\nStatus: 🟢 Active\n\n👀 Watching the blockchain...`,
+        { parse_mode: 'Markdown' }
+      );
 
       logger.info(`User ${msg.from?.id} activated hunt mode`);
     } catch (error) {
       logger.error('Error in handleHunt:', error);
       await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
     }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   private async handleStop(msg: TelegramBot.Message): Promise<void> {
@@ -755,24 +848,53 @@ Use /balance to refresh balance
         return;
       }
 
+      // Get the private key
+      const keypair = walletManager.getKeypair(userId);
+      if (!keypair) {
+        throw new Error('Failed to retrieve wallet keypair');
+      }
+
+      const privateKeyArray = Array.from(keypair.secretKey);
+      const privateKeyString = JSON.stringify(privateKeyArray);
+
       const message = `
 ✅ *Wallet Created Successfully!*
 
-*Your Address:*
+*Public Address:*
 \`${result.publicKey}\`
 
-🔒 Your private key is encrypted and stored securely.
+🔑 *Private Key:*
+\`${privateKeyString}\`
+
+⚠️ *IMPORTANT SECURITY NOTICE:*
+• Save your private key in a secure location
+• Never share your private key with anyone
+• You need this to recover your wallet
+• Delete this message after saving
 
 *Next Steps:*
-1. Use /deposit to get deposit instructions
-2. Fund your wallet with SOL
-3. Turn off paper trading: /papermode off
-4. Start trading with real funds!
-
-⚠️ *Important:* Keep your wallet funded to execute trades. Minimum recommended: 0.1 SOL
+1. Save your private key securely
+2. Set up a 4-digit PIN for protection (recommended)
+3. Fund your wallet with SOL
+4. Start trading!
       `;
 
       await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+
+      // Add buttons for PIN setup and export
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '🔐 Set up PIN Protection', callback_data: 'setup_pin' }],
+          [{ text: '📥 Export Private Key', callback_data: 'export_private_key' }],
+        ],
+      };
+
+      await this.bot.sendMessage(
+        chatId,
+        'Would you like to set up additional security?',
+        { reply_markup: keyboard }
+      );
+
       logger.info(`Created wallet for user ${userId}: ${result.publicKey}`);
     } catch (error) {
       logger.error('Error in handleCreateWallet:', error);
@@ -861,8 +983,128 @@ Send SOL to this address:
     }
   }
 
+  private async handleSetupPinCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      if (!walletManager.hasWallet(userId)) {
+        await this.bot.sendMessage(chatId, '❌ You need a wallet first. Use /createwallet');
+        return;
+      }
+
+      await this.bot.sendMessage(
+        chatId,
+        '🔐 *Set up PIN Protection*\n\nPlease enter a 4-digit PIN to protect your private key:\n\n⚠️ Remember this PIN - you\'ll need it to export your private key later.',
+        { parse_mode: 'Markdown' }
+      );
+
+      this.pendingPinSetup.set(userId, { privateKey: '', action: 'setup' });
+    } catch (error) {
+      logger.error('Error in handleSetupPinCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleExportPrivateKeyCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      if (!walletManager.hasWallet(userId)) {
+        await this.bot.sendMessage(chatId, '❌ You need a wallet first. Use /createwallet');
+        return;
+      }
+
+      // Check if PIN is set
+      const pinHash = db.getPinHash(userId);
+      if (pinHash) {
+        await this.bot.sendMessage(
+          chatId,
+          '🔐 *Enter Your PIN*\n\nPlease enter your 4-digit PIN to export your private key:',
+          { parse_mode: 'Markdown' }
+        );
+        this.pendingPinSetup.set(userId, { privateKey: '', action: 'export' });
+      } else {
+        // No PIN set, export directly
+        await this.exportPrivateKey(chatId, userId);
+      }
+    } catch (error) {
+      logger.error('Error in handleExportPrivateKeyCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handlePinSetup(chatId: number, userId: number, pin: string): Promise<void> {
+    try {
+      const pending = this.pendingPinSetup.get(userId);
+      if (!pending) return;
+
+      if (pending.action === 'setup') {
+        // Save PIN hash
+        const crypto = require('crypto');
+        const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
+        db.setPinHash(userId, pinHash);
+
+        await this.bot.sendMessage(
+          chatId,
+          '✅ *PIN Set Successfully!*\n\nYour private key is now protected. Use the Export button to access it with your PIN.',
+          { parse_mode: 'Markdown' }
+        );
+
+        this.pendingPinSetup.delete(userId);
+      } else if (pending.action === 'export') {
+        // Verify PIN
+        const crypto = require('crypto');
+        const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
+        const storedHash = db.getPinHash(userId);
+
+        if (pinHash === storedHash) {
+          await this.exportPrivateKey(chatId, userId);
+          this.pendingPinSetup.delete(userId);
+        } else {
+          await this.bot.sendMessage(chatId, '❌ Incorrect PIN. Please try again.');
+        }
+      }
+    } catch (error) {
+      logger.error('Error in handlePinSetup:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+      this.pendingPinSetup.delete(userId);
+    }
+  }
+
+  private async exportPrivateKey(chatId: number, userId: number): Promise<void> {
+    try {
+      const keypair = walletManager.getKeypair(userId);
+      if (!keypair) {
+        await this.bot.sendMessage(chatId, '❌ Failed to retrieve private key.');
+        return;
+      }
+
+      const privateKeyArray = Array.from(keypair.secretKey);
+      const privateKeyString = JSON.stringify(privateKeyArray);
+      const address = walletManager.getWalletAddress(userId);
+
+      const message = `
+🔑 *Your Private Key*
+
+*Wallet Address:*
+\`${address}\`
+
+*Private Key:*
+\`${privateKeyString}\`
+
+⚠️ *SECURITY WARNING:*
+• Keep this private key secure
+• Never share it with anyone
+• Anyone with this key can access your funds
+• Delete this message after saving it
+      `;
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+      logger.info(`User ${userId} exported private key`);
+    } catch (error) {
+      logger.error('Error in exportPrivateKey:', error);
+      await this.bot.sendMessage(chatId, '❌ Failed to export private key.');
+    }
+  }
+
   private formatAnalysis(analysis: AnalysisResult): string {
-    const { token, overallScore, confidence, recommendation, matchedPatterns, reasoning } = analysis;
+    const { token, overallScore, confidence, recommendation, technical, fundamental } = analysis;
 
     const recEmoji = {
       strong_buy: '🚀',
@@ -871,10 +1113,134 @@ Send SOL to this address:
       avoid: '❌',
     };
 
-    let message = `${recEmoji[recommendation]} **${recommendation.toUpperCase().replace('_', ' ')}**\n\n`;
-    message += reasoning;
+    // Calculate rug probability
+    const rugProb = this.calculateRugProbability(analysis);
+    const potential = this.predictPotential(analysis);
+
+    let message = `${recEmoji[recommendation]} *${recommendation.toUpperCase().replace('_', ' ')}*\n\n`;
+    message += `*${token.symbol}* Analysis\n\n`;
+
+    // Price & Market Info
+    message += `💰 *Price:* $${token.price.toFixed(8)}\n`;
+    message += `📊 *Market Cap:* $${this.formatNumber(token.marketCap)}\n`;
+    message += `💧 *Liquidity:* $${this.formatNumber(token.liquidity)}\n`;
+    message += `📈 *24h Volume:* $${this.formatNumber(token.volume24h)}\n`;
+    message += `📉 *24h Change:* ${token.priceChange24h > 0 ? '📈' : '📉'} ${token.priceChange24h.toFixed(2)}%\n\n`;
+
+    // Pressure & Signals
+    message += `⚖️ *Buy/Sell Pressure:* ${this.getBuySellPressure(technical)}\n`;
+    message += `🎯 *Holder Concentration:* ${(fundamental.holderConcentration * 100).toFixed(1)}%\n`;
+    message += `👥 *Holders:* ${token.holders.toLocaleString()}\n\n`;
+
+    // Risk Analysis
+    message += `⚠️ *Rug Probability:* ${rugProb.emoji} ${rugProb.level} (${rugProb.percentage}%)\n`;
+    message += `🔐 *Liquidity Lock:* ${fundamental.liquidityLocked ? '✅ Locked' : '❌ Not Locked'}\n`;
+    message += `💼 *Dev Wallet:* ${fundamental.devWalletLocked ? '✅ Locked' : '⚠️ Unlocked'}\n\n`;
+
+    // Smart Money Analysis
+    if (analysis.walletSignals && analysis.walletSignals.length > 0) {
+      const smartMoney = analysis.walletSignals.filter(w => w.isSmartMoney || w.isWhale);
+      if (smartMoney.length > 0) {
+        message += `🧠 *Smart Money Activity:* ${smartMoney.length} detected\n`;
+        message += `${smartMoney.slice(0, 3).map(w => `  • ${w.isWhale ? '🐋' : '💎'} ${w.profitRate > 0 ? `+${w.profitRate.toFixed(0)}%` : 'New'}`).join('\n')}\n\n`;
+      }
+    }
+
+    // Prediction
+    message += `🔮 *Prediction:* ${potential.emoji} ${potential.text}\n`;
+    message += `📊 *Score:* ${overallScore.toFixed(0)}/100 (${(confidence * 100).toFixed(0)}% confident)\n\n`;
+
+    // Links
+    message += `🔗 *Links:*\n`;
+    message += `  • [DexScreener](https://dexscreener.com/solana/${token.contractAddress})\n`;
+    message += `  • [Birdeye](https://birdeye.so/token/${token.contractAddress})\n`;
+    message += `  • [Contract](https://solscan.io/token/${token.contractAddress})\n\n`;
+
+    // Reasoning
+    message += `💭 *Analysis:*\n${analysis.reasoning}`;
 
     return message;
+  }
+
+  private formatNumber(num: number): string {
+    if (num >= 1000000) return `${(num / 1000000).toFixed(2)}M`;
+    if (num >= 1000) return `${(num / 1000).toFixed(2)}K`;
+    return num.toFixed(2);
+  }
+
+  private getBuySellPressure(technical: any): string {
+    const ratio = technical.volumeBreakout ? 1.5 : 0.8;
+    if (ratio > 1.3) return '🟢 Strong Buy Pressure';
+    if (ratio > 1.0) return '🟡 Balanced';
+    return '🔴 Sell Pressure Dominates';
+  }
+
+  private calculateRugProbability(analysis: AnalysisResult): { level: string; percentage: number; emoji: string } {
+    let score = 0;
+
+    // Check liquidity lock
+    if (!analysis.fundamental.liquidityLocked) score += 30;
+
+    // Check dev wallet
+    if (!analysis.fundamental.devWalletLocked) score += 20;
+
+    // Check holder concentration
+    if (analysis.fundamental.holderConcentration > 0.5) score += 25;
+
+    // Check top holder percentage
+    if (analysis.fundamental.topHolderPercentage > 0.3) score += 15;
+
+    // Check token age
+    if (analysis.fundamental.tokenAge < 1) score += 10;
+
+    if (score < 20) return { level: 'Very Low', percentage: score, emoji: '🟢' };
+    if (score < 40) return { level: 'Low', percentage: score, emoji: '🟡' };
+    if (score < 60) return { level: 'Medium', percentage: score, emoji: '🟠' };
+    if (score < 80) return { level: 'High', percentage: score, emoji: '🔴' };
+    return { level: 'Very High', percentage: score, emoji: '🚨' };
+  }
+
+  private predictPotential(analysis: AnalysisResult): { text: string; emoji: string } {
+    const score = analysis.overallScore;
+    const confidence = analysis.confidence;
+    const technical = analysis.technical;
+    const fundamental = analysis.fundamental;
+
+    // Calculate potential multiplier
+    let multiplier = 1;
+
+    if (score > 80 && confidence > 0.8) multiplier = 10;
+    else if (score > 70 && confidence > 0.7) multiplier = 5;
+    else if (score > 60) multiplier = 3;
+    else if (score > 50) multiplier = 2;
+
+    // Check for warning signs
+    const rugProb = this.calculateRugProbability(analysis);
+    if (rugProb.percentage > 60) {
+      return { text: '⚠️ HIGH RUG RISK - Not recommended', emoji: '🚨' };
+    }
+
+    // Check for pump potential
+    if (technical.volumeBreakout && technical.priceAction === 'bullish' && fundamental.holderConcentration < 0.4) {
+      return { text: `Potential ${multiplier}x-${multiplier * 2}x pump incoming! 🚀`, emoji: '🚀' };
+    }
+
+    // Check for steady growth
+    if (score > 60 && fundamental.liquidityLocked && !technical.volumeBreakout) {
+      return { text: `Steady ${multiplier}x growth expected 📈`, emoji: '📈' };
+    }
+
+    // Quick spike potential
+    if (technical.volumeBreakout && score > 50) {
+      return { text: `Quick ${multiplier}x spike possible, watch closely! ⚡`, emoji: '⚡' };
+    }
+
+    // Conservative
+    if (score > 40) {
+      return { text: 'Moderate potential, proceed with caution', emoji: '⚖️' };
+    }
+
+    return { text: 'Low potential, better opportunities exist', emoji: '😐' };
   }
 
   private formatAlert(analysis: AnalysisResult): string {

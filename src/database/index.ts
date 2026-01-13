@@ -103,6 +103,7 @@ class DatabaseManager {
         user_id INTEGER PRIMARY KEY,
         public_key TEXT NOT NULL,
         encrypted_private_key TEXT NOT NULL,
+        pin_hash TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         last_balance_check DATETIME,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
@@ -276,6 +277,21 @@ class DatabaseManager {
       WHERE user_id = ?
     `);
     stmt.run(userId);
+  }
+
+  setPinHash(userId: number, pinHash: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE user_wallets
+      SET pin_hash = ?
+      WHERE user_id = ?
+    `);
+    stmt.run(pinHash, userId);
+  }
+
+  getPinHash(userId: number): string | null {
+    const stmt = this.db.prepare('SELECT pin_hash FROM user_wallets WHERE user_id = ?');
+    const row = stmt.get(userId) as any;
+    return row?.pin_hash || null;
   }
 
   close(): void {
