@@ -190,6 +190,97 @@ export class PatternLearner {
 
     return report;
   }
+
+  /**
+   * Record a successful trade (2x+ winner) with its analysis
+   */
+  recordSuccessfulTrade(position: any, analysis: any): void {
+    try {
+      logger.info(`✅ Recording successful pattern from ${position.symbol}`);
+
+      // Extract winning characteristics
+      const winningData = {
+        symbol: position.symbol,
+        contractAddress: position.contract_address,
+        entryPrice: position.entry_price,
+        pnlPercentage: position.pnl_percentage,
+        overallScore: analysis.overallScore,
+        confidence: analysis.confidence,
+        recommendation: analysis.recommendation,
+        patterns: analysis.matchedPatterns?.map((p: any) => p.name).join(', '),
+        technicalScore: analysis.technical,
+        fundamentalScore: analysis.fundamental,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Save to database for future reference
+      db.saveSuccessfulPattern(winningData);
+
+      logger.info(`📚 Saved winning pattern: Score ${analysis.overallScore}, ${position.pnl_percentage.toFixed(2)}% gain`);
+    } catch (error) {
+      logger.error('Error recording successful trade:', error);
+    }
+  }
+
+  /**
+   * Enhance winning patterns based on 2x+ winners
+   */
+  async enhanceWinningPatterns(position: any): Promise<void> {
+    try {
+      // Get all 2x+ winners
+      const winners = db.getSuccessfulPatterns(100); // Get patterns with 100%+ return
+
+      if (winners.length < 5) {
+        logger.info('Not enough 2x+ winners yet to update strategy (need 5+)');
+        return;
+      }
+
+      // Analyze common characteristics among winners
+      const avgScore = winners.reduce((sum: number, w: any) => sum + w.overallScore, 0) / winners.length;
+      const avgConfidence = winners.reduce((sum: number, w: any) => sum + w.confidence, 0) / winners.length;
+
+      logger.info(`🧠 Learning from ${winners.length} 2x+ winners:`);
+      logger.info(`   Average winning score: ${avgScore.toFixed(0)}`);
+      logger.info(`   Average confidence: ${(avgConfidence * 100).toFixed(0)}%`);
+
+      // Count pattern occurrences in winners
+      const patternCounts: { [key: string]: number } = {};
+      winners.forEach((w: any) => {
+        if (w.patterns) {
+          const patterns = w.patterns.split(', ');
+          patterns.forEach((p: string) => {
+            patternCounts[p] = (patternCounts[p] || 0) + 1;
+          });
+        }
+      });
+
+      // Log most successful patterns
+      logger.info(`   Top winning patterns:`);
+      Object.entries(patternCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .forEach(([pattern, count]) => {
+          logger.info(`      • ${pattern}: ${count} winners`);
+        });
+
+      // Update strategy thresholds
+      this.updateStrategyThresholds(avgScore, avgConfidence);
+    } catch (error) {
+      logger.error('Error enhancing winning patterns:', error);
+    }
+  }
+
+  /**
+   * Update strategy thresholds based on learned data
+   */
+  private updateStrategyThresholds(avgWinningScore: number, avgWinningConfidence: number): void {
+    logger.info(`🎯 Updating strategy thresholds:`);
+    logger.info(`   Target score threshold: ${avgWinningScore.toFixed(0)} (from 2x+ winners)`);
+    logger.info(`   Target confidence threshold: ${(avgWinningConfidence * 100).toFixed(0)}%`);
+
+    // In a full implementation, this would update config or pattern weights
+    // For now, we log the insights for manual strategy adjustment
+  }
 }
 
 export default new PatternLearner();

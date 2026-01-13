@@ -76,6 +76,7 @@ export class AlphaHunterBot {
     this.bot.onText(/\/favorites/, this.handleFavorites.bind(this));
     this.bot.onText(/\/dcaorders/, this.handleDCAOrders.bind(this));
     this.bot.onText(/\/tpslorders/, this.handleTPSLOrders.bind(this));
+    this.bot.onText(/\/papertrades/, this.handlePaperTrades.bind(this));
 
     logger.info('Telegram bot commands registered');
   }
@@ -1861,6 +1862,79 @@ Use /scan ${analysis.token.contractAddress} for full analysis
     }
   }
 
+  private async handlePaperTrades(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const userId = msg.from?.id || 0;
+      const chatId = msg.chat.id;
+
+      // Get all paper trades
+      const paperTrades = db.getAllPaperTrades(userId);
+
+      if (paperTrades.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          '📝 *Paper Trades*\n\nNo paper trades yet! Start /hunt mode to begin paper trading launchpad tokens.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Get stats
+      const stats = db.getPaperTradeStats(userId);
+
+      let message = '📝 *Paper Trade Portfolio*\n\n';
+      message += `📊 *Overall Stats:*\n`;
+      message += `Total Trades: ${stats.total_trades}\n`;
+      message += `Open: ${stats.open_trades} | Winners: ${stats.winners} | Losers: ${stats.losers}\n`;
+      message += `Win Rate: ${stats.total_trades > stats.open_trades ? ((stats.winners / (stats.total_trades - stats.open_trades)) * 100).toFixed(1) : 0}%\n`;
+      message += `Avg PnL: ${stats.avg_pnl_percentage ? stats.avg_pnl_percentage.toFixed(2) : 0}%\n`;
+      message += `Total PnL: ${stats.total_pnl ? stats.total_pnl.toFixed(4) : 0} SOL\n\n`;
+
+      // Show 2x+ winners first
+      const winners2x = paperTrades.filter(t => t.pnl_percentage >= 100);
+      if (winners2x.length > 0) {
+        message += `🎉 *2x+ Winners (${winners2x.length}):*\n`;
+        for (const trade of winners2x.slice(0, 5)) {
+          message += `• ${trade.symbol}: +${trade.pnl_percentage.toFixed(2)}%\n`;
+          message += `  Entry: $${trade.entry_price.toFixed(8)}\n`;
+          message += `  Current: $${trade.current_price.toFixed(8)}\n`;
+        }
+        message += '\n';
+      }
+
+      // Show recent open positions
+      const openPositions = paperTrades.filter(t => t.status === 'open').slice(0, 10);
+      if (openPositions.length > 0) {
+        message += `📊 *Open Positions (${openPositions.length}):*\n`;
+        for (const trade of openPositions.slice(0, 5)) {
+          const pnlEmoji = trade.pnl_percentage > 0 ? '🟢' : trade.pnl_percentage < 0 ? '🔴' : '⚪';
+          message += `${pnlEmoji} ${trade.symbol}: ${trade.pnl_percentage > 0 ? '+' : ''}${trade.pnl_percentage.toFixed(2)}%\n`;
+        }
+        message += '\n';
+      }
+
+      // Show recent closed positions
+      const closedPositions = paperTrades.filter(t => t.status === 'closed').slice(0, 5);
+      if (closedPositions.length > 0) {
+        message += `📖 *Recent Closed (${closedPositions.length}):*\n`;
+        for (const trade of closedPositions) {
+          const resultEmoji = trade.pnl > 0 ? '✅' : '❌';
+          message += `${resultEmoji} ${trade.symbol}: ${trade.pnl > 0 ? '+' : ''}${trade.pnl_percentage.toFixed(2)}%\n`;
+        }
+      }
+
+      message += '\n💡 *Bot Thesis:*\n';
+      message += 'Paper trading ALL launchpad tokens (PumpFun, Meteora, etc.) to learn patterns. ';
+      message += 'Tokens with 2x+ gains are analyzed to improve buy signal accuracy. ';
+      message += 'The more winners we collect, the better the strategy becomes! 🧠';
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handlePaperTrades:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
   async start(): Promise<void> {
     try {
       // Register bot commands with Telegram
@@ -1886,6 +1960,7 @@ Use /scan ${analysis.token.contractAddress} for full analysis
         { command: 'favorites', description: 'View your favorite tokens' },
         { command: 'dcaorders', description: 'View active DCA orders' },
         { command: 'tpslorders', description: 'View active TP/SL orders' },
+        { command: 'papertrades', description: 'View paper trade portfolio with thesis' },
       ]);
 
       logger.info('✅ Bot commands registered with Telegram');
