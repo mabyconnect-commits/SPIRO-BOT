@@ -105,27 +105,27 @@ export class AlphaHunterBot {
       db.createUser(userId);
 
       const welcome = `
-🎯 **Welcome to Alpha Hunter!**
+🎯 *Welcome to Alpha Hunter!*
 
 I'm your AI-powered Solana runner detection system. Here's what I can do:
 
-🔍 **Scan & Analyze**
+🔍 *Scan & Analyze*
 • Paste any contract address → Instant deep analysis
 • /hunt → Start hunting for runners
-• /scan <CA> → Analyze specific token
+• /scan \\[CA\\] → Analyze specific token
 
-💰 **Trading**
-• /buy <CA> → Buy a token (paper or real)
-• /sell <position_id> → Close a position
+💰 *Trading*
+• /buy \\[CA\\] → Buy a token (paper or real)
+• /sell \\[position\\_id\\] → Close a position
 • /portfolio → View your positions
 
-⚙️ **Settings**
-• /preset <name> → Change trading preset
+⚙️ *Settings*
+• /preset \\[name\\] → Change trading preset
 • /autotrade on/off → Toggle auto-trading
 • /papermode on/off → Toggle paper trading
 • /settings → View your settings
 
-📊 **Learning**
+📊 *Learning*
 • /patterns → View pattern performance
 • /learning → AI learning report
 
@@ -149,20 +149,20 @@ Type /help for more info or paste a contract address to start!
       logger.info(`User ${msg.from?.id} requested help`);
 
       const help = `
-📚 **Alpha Hunter Commands**
+📚 *Alpha Hunter Commands*
 
-**Analysis:**
+*Analysis:*
 • Paste CA → Instant analysis
-• /scan <CA> → Deep token analysis
+• /scan \\[CA\\] → Deep token analysis
 • /hunt → Start auto-hunting
 • /stop → Stop hunting
 
-**Trading:**
-• /buy <CA> [amount] → Buy token
-• /sell <position> → Sell position
+*Trading:*
+• /buy \\[CA\\] \\[amount\\] → Buy token
+• /sell \\[position\\] → Sell position
 • /portfolio → View positions
 
-**Presets:**
+*Presets:*
 • /preset → Show current preset
 • /preset conservative → Low risk
 • /preset moderate → Medium risk
@@ -170,12 +170,12 @@ Type /help for more info or paste a contract address to start!
 • /preset aggressive → High risk
 • /preset degen → YOLO mode
 
-**Settings:**
+*Settings:*
 • /autotrade on/off → Auto-trade signals
 • /papermode on/off → Paper vs real
 • /settings → View all settings
 
-**Learning:**
+*Learning:*
 • /patterns → Pattern performance
 • /learning → AI learning stats
 
