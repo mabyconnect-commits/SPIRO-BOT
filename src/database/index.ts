@@ -110,6 +110,56 @@ class DatabaseManager {
       )
     `);
 
+    // Favorites table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        contract_address TEXT,
+        symbol TEXT,
+        name TEXT,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, contract_address),
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+      )
+    `);
+
+    // Take Profit / Stop Loss orders table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tp_sl_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        position_id TEXT,
+        contract_address TEXT,
+        order_type TEXT,
+        trigger_price REAL,
+        trigger_percentage REAL,
+        amount_percentage REAL DEFAULT 100,
+        status TEXT DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        triggered_at DATETIME,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+      )
+    `);
+
+    // DCA (Dollar Cost Averaging) orders table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS dca_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        contract_address TEXT,
+        symbol TEXT,
+        sol_amount REAL,
+        frequency_minutes INTEGER,
+        total_executions INTEGER,
+        executed_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active',
+        next_execution DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+      )
+    `);
+
     logger.info('Database initialized successfully');
   }
 
@@ -292,6 +342,115 @@ class DatabaseManager {
     const stmt = this.db.prepare('SELECT pin_hash FROM user_wallets WHERE user_id = ?');
     const row = stmt.get(userId) as any;
     return row?.pin_hash || null;
+  }
+
+  // Favorites methods
+  addFavorite(userId: number, contractAddress: string, symbol: string, name: string): void {
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO favorites (user_id, contract_address, symbol, name)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(userId, contractAddress, symbol, name);
+  }
+
+  removeFavorite(userId: number, contractAddress: string): void {
+    const stmt = this.db.prepare('DELETE FROM favorites WHERE user_id = ? AND contract_address = ?');
+    stmt.run(userId, contractAddress);
+  }
+
+  isFavorite(userId: number, contractAddress: string): boolean {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM favorites WHERE user_id = ? AND contract_address = ?');
+    const row = stmt.get(userId, contractAddress) as any;
+    return row.count > 0;
+  }
+
+  getFavorites(userId: number): Array<{ contractAddress: string; symbol: string; name: string; addedAt: string }> {
+    const stmt = this.db.prepare('SELECT * FROM favorites WHERE user_id = ? ORDER BY added_at DESC');
+    const rows = stmt.all(userId) as any[];
+    return rows.map(row => ({
+      contractAddress: row.contract_address,
+      symbol: row.symbol,
+      name: row.name,
+      addedAt: row.added_at,
+    }));
+  }
+
+  // TP/SL methods
+  createTPSLOrder(
+    userId: number,
+    positionId: string,
+    contractAddress: string,
+    orderType: 'tp' | 'sl',
+    triggerPrice: number,
+    triggerPercentage: number,
+    amountPercentage: number = 100
+  ): number {
+    const stmt = this.db.prepare(`
+      INSERT INTO tp_sl_orders (user_id, position_id, contract_address, order_type, trigger_price, trigger_percentage, amount_percentage)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const result = stmt.run(userId, positionId, contractAddress, orderType, triggerPrice, triggerPercentage, amountPercentage);
+    return result.lastInsertRowid as number;
+  }
+
+  getActiveTPSLOrders(userId: number, contractAddress?: string): Array<any> {
+    let query = 'SELECT * FROM tp_sl_orders WHERE user_id = ? AND status = ?';
+    const params: any[] = [userId, 'active'];
+
+    if (contractAddress) {
+      query += ' AND contract_address = ?';
+      params.push(contractAddress);
+    }
+
+    const stmt = this.db.prepare(query);
+    return stmt.all(...params) as any[];
+  }
+
+  cancelTPSLOrder(orderId: number): void {
+    const stmt = this.db.prepare('UPDATE tp_sl_orders SET status = ? WHERE id = ?');
+    stmt.run('cancelled', orderId);
+  }
+
+  // DCA methods
+  createDCAOrder(
+    userId: number,
+    contractAddress: string,
+    symbol: string,
+    solAmount: number,
+    frequencyMinutes: number,
+    totalExecutions: number
+  ): number {
+    const nextExecution = new Date(Date.now() + frequencyMinutes * 60 * 1000);
+    const stmt = this.db.prepare(`
+      INSERT INTO dca_orders (user_id, contract_address, symbol, sol_amount, frequency_minutes, total_executions, next_execution)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const result = stmt.run(userId, contractAddress, symbol, solAmount, frequencyMinutes, totalExecutions, nextExecution.toISOString());
+    return result.lastInsertRowid as number;
+  }
+
+  getActiveDCAOrders(userId: number): Array<any> {
+    const stmt = this.db.prepare('SELECT * FROM dca_orders WHERE user_id = ? AND status = ? ORDER BY next_execution');
+    return stmt.all(userId, 'active') as any[];
+  }
+
+  updateDCAOrder(orderId: number, executedCount: number, nextExecution: Date): void {
+    const stmt = this.db.prepare(`
+      UPDATE dca_orders
+      SET executed_count = ?, next_execution = ?
+      WHERE id = ?
+    `);
+    stmt.run(executedCount, nextExecution.toISOString(), orderId);
+  }
+
+  cancelDCAOrder(orderId: number): void {
+    const stmt = this.db.prepare('UPDATE dca_orders SET status = ? WHERE id = ?');
+    stmt.run('cancelled', orderId);
+  }
+
+  completeDCAOrder(orderId: number): void {
+    const stmt = this.db.prepare('UPDATE dca_orders SET status = ? WHERE id = ?');
+    stmt.run('completed', orderId);
   }
 
   close(): void {
