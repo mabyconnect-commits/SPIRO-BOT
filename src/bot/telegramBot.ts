@@ -116,7 +116,7 @@ I'm your AI-powered Solana runner detection system. Here's what I can do:
 
 💰 **Trading**
 • /buy <CA> → Buy a token (paper or real)
-• /sell <position_id> → Close a position
+• /sell <position\\_id> → Close a position
 • /portfolio → View your positions
 
 ⚙️ **Settings**
