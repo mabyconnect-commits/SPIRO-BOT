@@ -385,11 +385,13 @@ ${this.getPotentialText(analysis)}
       const updateMessage = `
 🔍 *Scanning in Progress...*
 
-Tokens scanned: ${stats.tokensScanned}
+Total scans: ${stats.tokensScanned}
+Unique tokens: ${stats.uniqueTokensScanned}
 Alerts triggered: ${stats.alertsTriggered}
 Last scan: ${new Date(stats.lastScanTime).toLocaleTimeString()}
 
 Status: Active 🟢
+⏭️ Skipping duplicates automatically
       `;
 
       // Send update to all active hunters
@@ -559,7 +561,7 @@ Ready to hunt some runners! 🚀
       const stats = tokenScanner.getStats();
       await this.bot.sendMessage(
         chatId,
-        `📊 *Scanner Status*\n\nTokens scanned: ${stats.tokensScanned}\nAlerts triggered: ${stats.alertsTriggered}\nStatus: 🟢 Active\n\n👀 Watching the blockchain...`,
+        `📊 *Scanner Status*\n\nTokens scanned: ${stats.tokensScanned}\nUnique tokens: ${stats.uniqueTokensScanned}\nAlerts triggered: ${stats.alertsTriggered}\nStatus: 🟢 Active\n\n👀 Watching launchpads for new opportunities...`,
         { parse_mode: 'Markdown' }
       );
 
@@ -593,9 +595,11 @@ Ready to hunt some runners! 🚀
 🛑 *Hunt mode stopped*
 
 Session Summary:
-• Tokens scanned: ${stats.tokensScanned}
+• Total scans: ${stats.tokensScanned}
+• Unique tokens: ${stats.uniqueTokensScanned}
 • Alerts sent: ${stats.alertsTriggered}
 
+✅ No duplicates were scanned
 Use /hunt to start hunting again!
       `;
 
@@ -1277,23 +1281,34 @@ Send SOL to this address:
       const address = walletManager.getWalletAddress(userId);
 
       const message = `
-🔑 *Your Private Key*
+🔑 *YOUR REAL SOLANA PRIVATE KEY*
 
 *Wallet Address:*
 \`${address}\`
 
-*Private Key:*
+*Private Key (Array Format):*
 \`${privateKeyString}\`
 
-⚠️ *SECURITY WARNING:*
-• Keep this private key secure
-• Never share it with anyone
-• Anyone with this key can access your funds
-• Delete this message after saving it
+*Base58 Format:*
+\`${Buffer.from(keypair.secretKey).toString('base64')}\`
+
+⚠️ *CRITICAL SECURITY WARNING:*
+• This is your ACTUAL private key - NOT a demo!
+• Keep this private key extremely secure
+• NEVER share it with anyone
+• Anyone with this key has COMPLETE access to your funds
+• Save it securely and DELETE this message immediately
+• You can import this key into Phantom, Solflare, or any Solana wallet
+
+💡 *How to Import:*
+1. Open your Solana wallet
+2. Select "Import Wallet"
+3. Paste the private key array above
+4. Your wallet will be imported with address: ${address}
       `;
 
       await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-      logger.info(`User ${userId} exported private key`);
+      logger.info(`User ${userId} exported REAL private key for address ${address}`);
     } catch (error) {
       logger.error('Error in exportPrivateKey:', error);
       await this.bot.sendMessage(chatId, '❌ Failed to export private key.');

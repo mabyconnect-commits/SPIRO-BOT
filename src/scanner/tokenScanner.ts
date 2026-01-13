@@ -14,6 +14,7 @@ export class TokenScanner {
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
   private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string }) => void> = [];
   private buySignalCallbacks: Array<(analysis: AnalysisResult) => void> = [];
+  private scannedTokens: Set<string> = new Set(); // Track scanned tokens to avoid duplicates
   private stats = {
     tokensScanned: 0,
     alertsTriggered: 0,
@@ -31,6 +32,13 @@ export class TokenScanner {
 
     this.isScanning = true;
     logger.info('🔍 Token scanner started');
+
+    // Clear scanned tokens cache every 24 hours
+    setInterval(() => {
+      const previousSize = this.scannedTokens.size;
+      this.scannedTokens.clear();
+      logger.info(`🔄 Cleared scanned tokens cache (${previousSize} tokens removed)`);
+    }, 86400000); // 24 hours
 
     // Run initial scan
     this.scan();
@@ -86,7 +94,10 @@ export class TokenScanner {
    * Get scanning statistics
    */
   getStats() {
-    return { ...this.stats };
+    return {
+      ...this.stats,
+      uniqueTokensScanned: this.scannedTokens.size,
+    };
   }
 
   /**
@@ -102,6 +113,15 @@ export class TokenScanner {
       logger.info(`Found ${trendingTokens.length} trending tokens`);
 
       for (const tokenAddress of trendingTokens) {
+        // Skip if already scanned
+        if (this.scannedTokens.has(tokenAddress)) {
+          logger.info(`⏭️ Skipping ${tokenAddress} - already scanned`);
+          continue;
+        }
+
+        // Mark as scanned
+        this.scannedTokens.add(tokenAddress);
+
         // Notify that we're scanning this token
         this.notifyScan(tokenAddress);
 
