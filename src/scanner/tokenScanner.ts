@@ -11,6 +11,11 @@ export class TokenScanner {
   private isScanning: boolean = false;
   private scanInterval: NodeJS.Timeout | null = null;
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
+  private stats = {
+    tokensScanned: 0,
+    alertsTriggered: 0,
+    lastScanTime: Date.now(),
+  };
 
   /**
    * Start continuous scanning
@@ -54,6 +59,20 @@ export class TokenScanner {
   }
 
   /**
+   * Check if scanner is active
+   */
+  isActive(): boolean {
+    return this.isScanning;
+  }
+
+  /**
+   * Get scanning statistics
+   */
+  getStats() {
+    return { ...this.stats };
+  }
+
+  /**
    * Perform a scan
    */
   private async scan(): Promise<void> {
@@ -67,6 +86,8 @@ export class TokenScanner {
 
       for (const tokenAddress of trendingTokens) {
         await this.analyzeAndAct(tokenAddress);
+        this.stats.tokensScanned++;
+        this.stats.lastScanTime = Date.now();
 
         // Small delay to avoid rate limits
         await this.sleep(1000);
@@ -167,6 +188,7 @@ export class TokenScanner {
    * Send alert to registered callbacks
    */
   private sendAlert(analysis: AnalysisResult): void {
+    this.stats.alertsTriggered++;
     for (const callback of this.alertCallbacks) {
       try {
         callback(analysis);

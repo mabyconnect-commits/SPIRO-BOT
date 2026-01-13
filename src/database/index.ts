@@ -97,6 +97,18 @@ class DatabaseManager {
       )
     `);
 
+    // User wallets table (for trading)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS user_wallets (
+        user_id INTEGER PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        encrypted_private_key TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_balance_check DATETIME,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+      )
+    `);
+
     logger.info('Database initialized successfully');
   }
 
@@ -235,6 +247,35 @@ class DatabaseManager {
       avgReturn: result.avg_return || 0,
       sampleSize: result.total || 0,
     };
+  }
+
+  createWallet(userId: number, publicKey: string, encryptedPrivateKey: string): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO user_wallets (user_id, public_key, encrypted_private_key)
+      VALUES (?, ?, ?)
+    `);
+    stmt.run(userId, publicKey, encryptedPrivateKey);
+  }
+
+  getUserWallet(userId: number): { publicKey: string; encryptedPrivateKey: string } | null {
+    const stmt = this.db.prepare('SELECT * FROM user_wallets WHERE user_id = ?');
+    const row = stmt.get(userId) as any;
+
+    if (!row) return null;
+
+    return {
+      publicKey: row.public_key,
+      encryptedPrivateKey: row.encrypted_private_key,
+    };
+  }
+
+  updateWalletBalanceCheck(userId: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE user_wallets
+      SET last_balance_check = CURRENT_TIMESTAMP
+      WHERE user_id = ?
+    `);
+    stmt.run(userId);
   }
 
   close(): void {
