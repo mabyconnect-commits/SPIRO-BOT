@@ -245,6 +245,11 @@ ${this.getPotentialText(analysis)}
             `;
 
             const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+
+            // Shorten symbol and name to avoid exceeding 64-byte callback limit
+            const shortSymbol = analysis.token.symbol.substring(0, 10);
+            const shortName = analysis.token.name.substring(0, 15);
+
             const keyboard = {
               inline_keyboard: [
                 [
@@ -256,8 +261,8 @@ ${this.getPotentialText(analysis)}
                   { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
                 ],
                 [
-                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${analysis.token.symbol}` },
-                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${shortSymbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${shortSymbol}:${shortName}` },
                 ],
                 [
                   { text: '📊 Full Details', callback_data: `details:${analysis.token.contractAddress}` },
@@ -316,6 +321,11 @@ ${this.getPotentialText(analysis)}
 
             // Show action buttons
             const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+
+            // Shorten symbol and name to avoid exceeding 64-byte callback limit
+            const shortSymbol = analysis.token.symbol.substring(0, 10);
+            const shortName = analysis.token.name.substring(0, 15);
+
             const keyboard = {
               inline_keyboard: [
                 [
@@ -327,11 +337,12 @@ ${this.getPotentialText(analysis)}
                   { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
                 ],
                 [
-                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${analysis.token.symbol}` },
-                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${shortSymbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${shortSymbol}:${shortName}` },
                 ],
                 [
                   { text: '📊 Details', callback_data: `details:${analysis.token.contractAddress}` },
+                  { text: '📋 Copy CA', callback_data: `copy:${analysis.token.contractAddress}` },
                 ],
               ],
             };
@@ -609,46 +620,63 @@ Use /hunt to start hunting again!
   }
 
   private async analyzeAndRespond(chatId: number, contractAddress: string): Promise<void> {
-    await this.bot.sendMessage(chatId, '🔍 Analyzing token... This may take a moment.');
+    try {
+      await this.bot.sendMessage(chatId, '🔍 Analyzing token... This may take a moment.');
 
-    const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
+      const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
 
-    if (!analysis) {
-      await this.bot.sendMessage(chatId, '❌ Failed to analyze token. Make sure the contract address is valid.');
-      return;
+      if (!analysis) {
+        await this.bot.sendMessage(chatId, '❌ Failed to analyze token. Make sure the contract address is valid.');
+        return;
+      }
+
+      const message = this.formatAnalysis(analysis);
+      await this.bot.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      });
+
+      // Show action buttons
+      const userId = chatId; // For now, assume chatId = userId
+      const isFav = db.isFavorite(userId, contractAddress);
+
+      // Shorten symbol and name to avoid exceeding 64-byte callback limit
+      const shortSymbol = analysis.token.symbol.substring(0, 10);
+      const shortName = analysis.token.name.substring(0, 15);
+
+      // Build keyboard with action buttons
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '💰 Buy', callback_data: `buy:${contractAddress}` },
+            { text: '💸 Sell', callback_data: `sell:${contractAddress}` },
+          ],
+          [
+            { text: '🎯 Set TP', callback_data: `settp:${contractAddress}` },
+            { text: '🛡️ Set SL', callback_data: `setsl:${contractAddress}` },
+          ],
+          [
+            { text: '📊 Set DCA', callback_data: `setdca:${contractAddress}:${shortSymbol}` },
+            { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${contractAddress}` : `favorite:${contractAddress}:${shortSymbol}:${shortName}` },
+          ],
+          [
+            { text: '📊 Details', callback_data: `details:${contractAddress}` },
+            { text: '📋 Copy CA', callback_data: `copy:${contractAddress}` },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(
+        chatId,
+        'What would you like to do?',
+        { reply_markup: keyboard }
+      );
+
+      logger.info(`Successfully sent analysis and buttons for ${analysis.token.symbol}`);
+    } catch (error) {
+      logger.error('Error in analyzeAndRespond:', error);
+      throw error; // Re-throw to be caught by the outer handler
     }
-
-    const message = this.formatAnalysis(analysis);
-    await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-
-    // Show action buttons
-    const userId = chatId; // For now, assume chatId = userId
-    const isFav = db.isFavorite(userId, contractAddress);
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '💰 Buy', callback_data: `buy:${contractAddress}` },
-          { text: '💸 Sell', callback_data: `sell:${contractAddress}` },
-        ],
-        [
-          { text: '🎯 Set TP', callback_data: `settp:${contractAddress}` },
-          { text: '🛡️ Set SL', callback_data: `setsl:${contractAddress}` },
-        ],
-        [
-          { text: '📊 Set DCA', callback_data: `setdca:${contractAddress}:${analysis.token.symbol}` },
-          { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${contractAddress}` : `favorite:${contractAddress}:${analysis.token.symbol}:${analysis.token.name}` },
-        ],
-        [
-          { text: '📊 Details', callback_data: `details:${contractAddress}` },
-        ],
-      ],
-    };
-
-    await this.bot.sendMessage(
-      chatId,
-      'What would you like to do?',
-      { reply_markup: keyboard }
-    );
   }
 
   private async handleBuy(msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
