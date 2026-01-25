@@ -137,7 +137,7 @@ export class AlphaHunterBot {
 
           logger.info(`Received message from user ${userId}: ${text.substring(0, 50)}...`);
 
-          // Check if user is setting up a PIN
+          // Check if user is setting up a PIN (allow this without subscription)
           if (this.pendingPinSetup.has(userId)) {
             // Validate PIN (4 digits)
             if (/^\d{4}$/.test(text)) {
@@ -147,6 +147,12 @@ export class AlphaHunterBot {
               await this.bot.sendMessage(msg.chat.id, '❌ Invalid PIN. Please enter exactly 4 digits.');
               return;
             }
+          }
+
+          // CHECK SUBSCRIPTION FOR ALL OTHER FEATURES
+          const hasAccess = await this.checkAccess(msg);
+          if (!hasAccess) {
+            return; // Block unsubscribed users
           }
 
           // Check if user has pending actions (TP, SL, DCA setup)
@@ -180,6 +186,28 @@ export class AlphaHunterBot {
         if (!chatId || !data) return;
 
         logger.info(`Callback query from user ${query.from.id}: ${data}`);
+
+        // Allow copy and confirm_payment without subscription
+        const publicCallbacks = ['copy:', 'confirm_payment'];
+        const isPublicCallback = publicCallbacks.some(cb => data.startsWith(cb) || data === cb);
+
+        // CHECK SUBSCRIPTION for all non-public callbacks
+        if (!isPublicCallback) {
+          const username = query.from.username;
+          const userId = query.from.id;
+
+          // Check if admin
+          if (!(username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase())) {
+            // Check subscription
+            if (!subscriptionManager.hasAccess(userId, username)) {
+              await this.bot.answerCallbackQuery(query.id, {
+                text: '🔒 Subscribe first! Use /subscribe',
+                show_alert: true
+              });
+              return;
+            }
+          }
+        }
 
         if (data.startsWith('buy:')) {
           const contractAddress = data.substring(4);
@@ -238,6 +266,10 @@ export class AlphaHunterBot {
           await this.handleAlphaPicksCallback(chatId);
         } else if (data === 'view_moonshots') {
           await this.handleMoonshotsCallback(chatId);
+        } else if (data === 'subscribe_now') {
+          // Redirect to subscribe - create a fake message object
+          const fakeMsg = { chat: { id: chatId }, from: query.from } as TelegramBot.Message;
+          await this.handleSubscribe(fakeMsg);
         }
 
         // Answer the callback query to remove loading state
@@ -646,6 +678,43 @@ Status: Active 🟢
       const hasAccess = subscriptionManager.hasAccess(userId, username);
       const isAdmin = username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase();
 
+      // Show different message for non-subscribers
+      if (!hasAccess && !isAdmin) {
+        const lockedWelcome = `
+🎯 *Welcome to Alpha Hunter!*
+
+I'm your AI-powered Solana token scanner and trading bot.
+
+🔒 *SUBSCRIPTION REQUIRED*
+
+To access all features, you need an active subscription.
+
+💰 *Price:* ${subscriptionManager.getPrice()} SOL
+⏰ *Duration:* 30 days
+
+✨ *What You Get:*
+• 🔍 Auto-scan launchpad tokens (PumpFun, Meteora)
+• 📝 Paper trade ALL tokens automatically
+• ⭐ Alpha picks (score ≥29) with badges
+• 🚀 100x moonshot tracking & analysis
+• 🤖 AI-powered buy signals
+• 💰 Real trading with your wallet
+• 📊 Comprehensive PnL tracking
+
+👉 Use /subscribe to get started!
+        `.trim();
+
+        await this.bot.sendMessage(chatId, lockedWelcome, {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '💳 Subscribe Now', callback_data: 'subscribe_now' }]
+            ]
+          }
+        });
+        return;
+      }
+
       const paperBalance = db.getPaperBalance(userId);
 
       const welcome = `
@@ -653,28 +722,24 @@ Status: Active 🟢
 
 I'm your AI-powered Solana token scanner and trading bot.
 
-${isAdmin ? '👑 *Admin Access Granted!*' : hasAccess ? '✅ *Subscription Active*' : '🔒 *Subscription Required* - Use /subscribe'}
+${isAdmin ? '👑 *Admin Access Granted!*' : '✅ *Subscription Active*'}
 
 💰 *Paper Balance:* ${paperBalance.toFixed(2)} SOL
 
 📊 *What I Do:*
 • Scan launchpad tokens (PumpFun, Meteora, etc.)
 • Paper trade automatically to learn patterns
-• Send buy signals for high-potential tokens
-• Analyze any token you paste - with lore & buy/sell recommendation
-
-🤖 *Auto Features:*
-• Scans every 2 minutes for new tokens
-• Mandatory buy signal every 5 minutes
-• Paper trades with 0.35 SOL (0.5 for high confidence)
-• Learns from 2x+ winners to improve
+• ⭐ Alpha picks (score ≥29) tracked
+• 🚀 100x moonshots monitored
+• Send buy signals for high-potential tokens (score ≥30)
 
 🔍 *Commands:*
-• /hunt - Start auto-scanning
+• /hunt - Start YOUR personal scanner
+• /papertrades - View all trades with PnL stats
+• /alphapicks - View Alpha picks
+• /moonshots - View 100x tokens
 • /positions - View open trades
-• /history - View trade history
-• /portfolio - Full portfolio summary
-• /editsettings - Edit TP, SL, alerts
+• /realtrade - Toggle real/paper trading
 
 📈 *Trading:*
 • Paste any CA → Full analysis + lore
