@@ -140,12 +140,23 @@ export class TradingEngine {
     solAmount: number,
     userId: number
   ): Promise<TradePosition | null> {
-    if (!this.wallet) {
-      logger.error('No wallet configured for real trading');
+    // Get user's wallet
+    const userWallet = await this.getUserWallet(userId);
+    if (!userWallet) {
+      logger.error(`No wallet configured for user ${userId}`);
       return null;
     }
 
     try {
+      // Check user's balance first
+      const balance = await this.connection.getBalance(userWallet.publicKey);
+      const balanceInSol = balance / LAMPORTS_PER_SOL;
+
+      if (balanceInSol < solAmount + 0.01) { // 0.01 SOL for fees
+        logger.error(`Insufficient balance for user ${userId}: ${balanceInSol.toFixed(4)} SOL < ${solAmount} SOL needed`);
+        return null;
+      }
+
       // Get quote from Jupiter
       const amountInLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
       const quote = await jupiter.getQuote(
@@ -163,7 +174,7 @@ export class TradingEngine {
       // Get swap transaction
       const swapResult = await jupiter.getSwapTransaction(
         quote,
-        this.wallet.publicKey.toString()
+        userWallet.publicKey.toString()
       );
 
       if (!swapResult || !swapResult.swapTransaction) {
@@ -174,7 +185,7 @@ export class TradingEngine {
       // Deserialize and sign transaction
       const transactionBuf = Buffer.from(swapResult.swapTransaction, 'base64');
       const transaction = VersionedTransaction.deserialize(transactionBuf);
-      transaction.sign([this.wallet]);
+      transaction.sign([userWallet]);
 
       // Send transaction
       const signature = await this.connection.sendRawTransaction(
@@ -211,7 +222,8 @@ export class TradingEngine {
         type: 'real',
       };
 
-      db.savePosition(position);
+      // Save position with user ID
+      this.savePositionForUser(userId, position);
 
       logger.info(
         `✅ REAL BUY: ${solAmount} SOL → ${tokenAmount.toFixed(2)} ${analysis.token.symbol} @ $${tokenPrice.toFixed(8)}`
@@ -226,6 +238,49 @@ export class TradingEngine {
   }
 
   /**
+   * Get user's keypair for real trading
+   */
+  private async getUserWallet(userId: number): Promise<Keypair | null> {
+    const walletData = db.getUserWallet(userId);
+    if (!walletData) {
+      return null;
+    }
+
+    try {
+      // Decrypt and reconstruct keypair
+      const decryptedKey = this.decryptPrivateKey(walletData.encryptedPrivateKey);
+      const privateKeyBytes = new Uint8Array(JSON.parse(decryptedKey));
+      return Keypair.fromSecretKey(privateKeyBytes);
+    } catch (error) {
+      logger.error(`Failed to get wallet for user ${userId}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Decrypt private key
+   */
+  private decryptPrivateKey(encryptedKey: string): string {
+    const algorithm = 'aes-256-cbc';
+    const key = crypto.scryptSync(config.security?.encryptionKey || 'default-key', 'salt', 32);
+    const [ivHex, encrypted] = encryptedKey.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const decipher = crypto.createDecipheriv(algorithm, key, iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  }
+
+  /**
+   * Save position for a specific user
+   */
+  private savePositionForUser(userId: number, position: TradePosition): void {
+    // Modify position to include user_id
+    const positionWithUser = { ...position, userId };
+    db.savePosition(positionWithUser as any);
+  }
+
+  /**
    * Execute a sell order
    */
   async sell(
@@ -237,7 +292,7 @@ export class TradingEngine {
       if (paperTrade || position.type === 'paper') {
         return this.executePaperSell(position, userId);
       } else {
-        return this.executeRealSell(position);
+        return this.executeRealSell(position, userId);
       }
     } catch (error) {
       logger.error('Sell error:', error);
@@ -290,9 +345,11 @@ export class TradingEngine {
   /**
    * Execute real trading sell via Jupiter
    */
-  private async executeRealSell(position: TradePosition): Promise<boolean> {
-    if (!this.wallet) {
-      logger.error('No wallet configured for real trading');
+  private async executeRealSell(position: TradePosition, userId: number = 0): Promise<boolean> {
+    // Get user's wallet
+    const userWallet = await this.getUserWallet(userId);
+    if (!userWallet) {
+      logger.error(`No wallet configured for user ${userId} for sell`);
       return false;
     }
 
@@ -314,7 +371,7 @@ export class TradingEngine {
       // Get swap transaction
       const swapResult = await jupiter.getSwapTransaction(
         quote,
-        this.wallet.publicKey.toString()
+        userWallet.publicKey.toString()
       );
 
       if (!swapResult || !swapResult.swapTransaction) {
@@ -325,7 +382,7 @@ export class TradingEngine {
       // Sign and send
       const transactionBuf = Buffer.from(swapResult.swapTransaction, 'base64');
       const transaction = VersionedTransaction.deserialize(transactionBuf);
-      transaction.sign([this.wallet]);
+      transaction.sign([userWallet]);
 
       const signature = await this.connection.sendRawTransaction(
         transaction.serialize(),
