@@ -6,6 +6,7 @@ import tokenScanner from '../scanner/tokenScanner';
 import patternLearner from '../learning/patternLearner';
 import db from '../database';
 import walletManager from '../services/walletManager';
+import subscriptionManager from '../services/subscriptionManager';
 import logger from '../utils/logger';
 import { AnalysisResult } from '../types';
 
@@ -17,11 +18,15 @@ interface PendingAction {
   data?: any;
 }
 
+// Free admin username
+const FREE_ADMIN_USERNAME = config.subscription?.freeAdminUsername || 'mabyconnect2000';
+
 export class AlphaHunterBot {
   private bot: TelegramBot;
   private activeHunters: Map<number, boolean> = new Map(); // Track users who have hunt mode active
   private pendingPinSetup: Map<number, { privateKey: string; action: string }> = new Map(); // Track pending PIN setups
   private pendingActions: Map<number, PendingAction> = new Map(); // Track pending user actions (TP, SL, DCA setup)
+  private pendingPayments: Map<number, { paymentId: number; walletAddress: string }> = new Map(); // Track pending subscription payments
 
   constructor() {
     this.bot = new TelegramBot(config.telegram.botToken, { polling: true });
@@ -77,6 +82,16 @@ export class AlphaHunterBot {
     this.bot.onText(/\/dcaorders/, this.handleDCAOrders.bind(this));
     this.bot.onText(/\/tpslorders/, this.handleTPSLOrders.bind(this));
     this.bot.onText(/\/papertrades/, this.handlePaperTrades.bind(this));
+
+    // New commands
+    this.bot.onText(/\/subscribe/, this.handleSubscribe.bind(this));
+    this.bot.onText(/\/confirmpayment/, this.handleConfirmPayment.bind(this));
+    this.bot.onText(/\/positions/, this.handlePositions.bind(this));
+    this.bot.onText(/\/history/, this.handleHistory.bind(this));
+    this.bot.onText(/\/editsettings/, this.handleEditSettings.bind(this));
+    this.bot.onText(/\/setalert(?:\s+(\d+(?:\.\d+)?))?/, this.handleSetAlert.bind(this));
+    this.bot.onText(/\/setpresetparam(?:\s+(\w+)\s+(\d+(?:\.\d+)?))?/, this.handleSetPresetParam.bind(this));
+    this.bot.onText(/\/resetbalance/, this.handleResetBalance.bind(this));
 
     logger.info('Telegram bot commands registered');
   }
@@ -173,6 +188,21 @@ export class AlphaHunterBot {
           await this.handleExportPrivateKeyCallback(chatId, query.from.id);
         } else if (data === 'setup_pin') {
           await this.handleSetupPinCallback(chatId, query.from.id);
+        } else if (data === 'confirm_payment') {
+          await this.handleConfirmPaymentCallback(chatId, query.from.id);
+        } else if (data === 'show_history') {
+          await this.handleHistoryCallback(chatId, query.from.id);
+        } else if (data === 'refresh_positions') {
+          await this.handleRefreshPositionsCallback(chatId, query.from.id);
+        } else if (data.startsWith('set_alert:')) {
+          const value = parseInt(data.substring(10));
+          await this.handleSetAlertCallback(chatId, query.from.id, value);
+        } else if (data.startsWith('set_tp:')) {
+          const value = parseInt(data.substring(7));
+          await this.handleSetTPValueCallback(chatId, query.from.id, value);
+        } else if (data.startsWith('set_sl:')) {
+          const value = parseInt(data.substring(7));
+          await this.handleSetSLValueCallback(chatId, query.from.id, value);
         }
 
         // Answer the callback query to remove loading state
@@ -187,26 +217,30 @@ export class AlphaHunterBot {
   }
 
   private setupAlerts(): void {
-    // Setup scan notifications to show tokens being scanned
-    tokenScanner.onScanNotify(async (tokenInfo: { address: string; name?: string; symbol?: string }) => {
+    // Setup scan notifications to show tokens being scanned with full details
+    tokenScanner.onScanNotify(async (tokenInfo: { address: string; name?: string; symbol?: string; score?: number; confidence?: number }) => {
       for (const [chatId, isActive] of this.activeHunters.entries()) {
         if (isActive) {
           try {
             // Get token info from DexScreener if not provided
-            let displayName = tokenInfo.symbol || 'Token';
+            let displayName = tokenInfo.name || 'Unknown';
+            let displaySymbol = tokenInfo.symbol || 'TOKEN';
             let displayCA = tokenInfo.address;
-
-            // Format CA for display (first 8 and last 6 characters)
-            const shortCA = `${displayCA.substring(0, 8)}...${displayCA.substring(displayCA.length - 6)}`;
+            let scoreText = tokenInfo.score !== undefined ? `Score: ${tokenInfo.score.toFixed(0)}/100` : '';
+            let confidenceText = tokenInfo.confidence !== undefined ? `Confidence: ${(tokenInfo.confidence * 100).toFixed(0)}%` : '';
 
             const scanMessage = `
 🔍 *Scanning Token*
 
-📝 **${displayName}**
-📋 CA: \`${displayCA}\`
+📝 *${displaySymbol}* - ${displayName}
+${scoreText ? `📊 ${scoreText}` : ''}
+${confidenceText ? `🎯 ${confidenceText}` : ''}
 
-⏳ Analyzing...
-            `;
+📋 *Contract Address:*
+\`${displayCA}\`
+
+⏳ Analyzing patterns and signals...
+            `.trim();
 
             await this.bot.sendMessage(chatId, scanMessage, {
               parse_mode: 'Markdown',
@@ -214,12 +248,72 @@ export class AlphaHunterBot {
                 inline_keyboard: [
                   [
                     { text: '📋 Copy CA', callback_data: `copy:${displayCA}` },
+                    { text: '🔍 Analyze', callback_data: `details:${displayCA}` },
                   ],
                 ]
               }
             });
           } catch (error) {
             logger.error(`Failed to send scan notification to chat ${chatId}:`, error);
+          }
+        }
+      }
+    });
+
+    // Setup forced buy signal notifications (mandatory 5-min signals)
+    tokenScanner.onForcedBuySignal(async (analysis: AnalysisResult, reason: string) => {
+      for (const [chatId, isActive] of this.activeHunters.entries()) {
+        if (isActive) {
+          try {
+            const forcedSignalMessage = `
+🚨 *MANDATORY BUY SIGNAL* 🚨
+
+⏰ *${reason}*
+
+💎 **${analysis.token.symbol}** - ${analysis.token.name}
+
+📊 Score: ${analysis.overallScore.toFixed(0)}/100
+🎯 Confidence: ${(analysis.confidence * 100).toFixed(0)}%
+💰 Price: $${analysis.token.price.toFixed(8)}
+📈 24h: ${analysis.token.priceChange24h > 0 ? '+' : ''}${analysis.token.priceChange24h.toFixed(2)}%
+
+${this.getPotentialText(analysis)}
+
+📝 *This token was selected as the best opportunity in the last 5 minutes.*
+✅ Paper trade executed automatically!
+            `.trim();
+
+            const isFav = db.isFavorite(chatId, analysis.token.contractAddress);
+            const shortSymbol = analysis.token.symbol.substring(0, 10);
+            const shortName = analysis.token.name.substring(0, 15);
+
+            const keyboard = {
+              inline_keyboard: [
+                [
+                  { text: '💰 Buy Now', callback_data: `buy:${analysis.token.contractAddress}` },
+                  { text: '💸 Sell', callback_data: `sell:${analysis.token.contractAddress}` },
+                ],
+                [
+                  { text: '🎯 Set TP', callback_data: `settp:${analysis.token.contractAddress}` },
+                  { text: '🛡️ Set SL', callback_data: `setsl:${analysis.token.contractAddress}` },
+                ],
+                [
+                  { text: '📊 Set DCA', callback_data: `setdca:${analysis.token.contractAddress}:${shortSymbol}` },
+                  { text: isFav ? '⭐ Unfavorite' : '⭐ Favorite', callback_data: isFav ? `unfavorite:${analysis.token.contractAddress}` : `favorite:${analysis.token.contractAddress}:${shortSymbol}:${shortName}` },
+                ],
+                [
+                  { text: '📊 Full Analysis', callback_data: `details:${analysis.token.contractAddress}` },
+                  { text: '📋 Copy CA', callback_data: `copy:${analysis.token.contractAddress}` },
+                ],
+              ],
+            };
+
+            await this.bot.sendMessage(chatId, forcedSignalMessage, {
+              parse_mode: 'Markdown',
+              reply_markup: keyboard
+            });
+          } catch (error) {
+            logger.error(`Failed to send forced buy signal to chat ${chatId}:`, error);
           }
         }
       }
@@ -415,39 +509,60 @@ Status: Active 🟢
     try {
       const chatId = msg.chat.id;
       const userId = msg.from?.id || 0;
+      const username = msg.from?.username;
 
-      logger.info(`User ${userId} sent /start command`);
+      logger.info(`User ${userId} (${username || 'no username'}) sent /start command`);
 
       // Create user if not exists
       db.createUser(userId);
 
+      // Update username if available
+      if (username) {
+        db.updateTelegramUsername(userId, username);
+      }
+
+      // Check if admin or subscribed
+      const hasAccess = subscriptionManager.hasAccess(userId, username);
+      const isAdmin = username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase();
+
+      const paperBalance = db.getPaperBalance(userId);
+
       const welcome = `
 🎯 *Welcome to Alpha Hunter!*
 
-I'm your AI-powered Solana runner detection system. Here's what I can do:
+I'm your AI-powered Solana token scanner and trading bot.
 
-🔍 *Scan & Analyze*
-• Paste any contract address → Instant deep analysis
-• /hunt → Start hunting for runners
-• /scan \\[CA\\] → Analyze specific token
+${isAdmin ? '👑 *Admin Access Granted!*' : hasAccess ? '✅ *Subscription Active*' : '🔒 *Subscription Required* - Use /subscribe'}
 
-💰 *Trading*
-• /buy \\[CA\\] → Buy a token (paper or real)
-• /sell \\[position\\_id\\] → Close a position
-• /portfolio → View your positions
+💰 *Paper Balance:* ${paperBalance.toFixed(2)} SOL
 
-⚙️ *Settings*
-• /preset \\[name\\] → Change trading preset
-• /autotrade on/off → Toggle auto-trading
-• /papermode on/off → Toggle paper trading
-• /settings → View your settings
+📊 *What I Do:*
+• Scan launchpad tokens (PumpFun, Meteora, etc.)
+• Paper trade automatically to learn patterns
+• Send buy signals for high-potential tokens
+• Analyze any token you paste - with lore & buy/sell recommendation
 
-📊 *Learning*
-• /patterns → View pattern performance
-• /learning → AI learning report
+🤖 *Auto Features:*
+• Scans every 2 minutes for new tokens
+• Mandatory buy signal every 5 minutes
+• Paper trades with 0.35 SOL (0.5 for high confidence)
+• Learns from 2x+ winners to improve
 
-Type /help for more info or paste a contract address to start!
-      `;
+🔍 *Commands:*
+• /hunt - Start auto-scanning
+• /positions - View open trades
+• /history - View trade history
+• /portfolio - Full portfolio summary
+• /editsettings - Edit TP, SL, alerts
+
+📈 *Trading:*
+• Paste any CA → Full analysis + lore
+• /buy \\[CA\\] - Buy a token
+• /sell \\[position\\] - Sell position
+• /createwallet - Create trading wallet
+
+Type /help for all commands or paste a token address!
+      `.trim();
 
       await this.bot.sendMessage(chatId, welcome, { parse_mode: 'Markdown' });
       logger.info(`Successfully sent welcome message to user ${userId}`);
@@ -635,14 +750,34 @@ Use /hunt to start hunting again!
         return;
       }
 
+      // Generate token lore and buy recommendation
+      const loreAnalysis = this.generateTokenLore(analysis);
+
+      // Save token lore to database
+      db.saveTokenLore({
+        contractAddress: analysis.token.contractAddress,
+        symbol: analysis.token.symbol,
+        name: analysis.token.name,
+        lore: loreAnalysis.lore,
+        narrativeStrength: loreAnalysis.narrativeStrength,
+        isBuy: loreAnalysis.isBuy,
+        buyReason: loreAnalysis.buyReason,
+        notBuyReason: loreAnalysis.notBuyReason,
+      });
+
+      // Format main analysis
       const message = this.formatAnalysis(analysis);
       await this.bot.sendMessage(chatId, message, {
         parse_mode: 'Markdown',
         disable_web_page_preview: true
       });
 
+      // Send lore/narrative analysis as separate message
+      const loreMessage = this.formatLoreMessage(analysis, loreAnalysis);
+      await this.bot.sendMessage(chatId, loreMessage, { parse_mode: 'Markdown' });
+
       // Show action buttons
-      const userId = chatId; // For now, assume chatId = userId
+      const userId = chatId;
       const isFav = db.isFavorite(userId, contractAddress);
 
       // Shorten symbol and name to avoid exceeding 64-byte callback limit
@@ -680,8 +815,144 @@ Use /hunt to start hunting again!
       logger.info(`Successfully sent analysis and buttons for ${analysis.token.symbol}`);
     } catch (error) {
       logger.error('Error in analyzeAndRespond:', error);
-      throw error; // Re-throw to be caught by the outer handler
+      throw error;
     }
+  }
+
+  // Generate token lore and buy/not buy recommendation
+  private generateTokenLore(analysis: AnalysisResult): {
+    lore: string;
+    narrativeStrength: number;
+    isBuy: boolean;
+    buyReason?: string;
+    notBuyReason?: string;
+  } {
+    const { token, overallScore, confidence, technical, fundamental, social, recommendation } = analysis;
+
+    // Generate lore/narrative based on token characteristics
+    let lore = '';
+    let narrativeStrength = 0;
+
+    // Check token name for narrative elements
+    const name = token.name.toLowerCase();
+    const symbol = token.symbol.toLowerCase();
+
+    // Detect narrative categories
+    const isAnimal = /dog|cat|shiba|inu|doge|pepe|frog|bird|bear|bull|ape|monkey|fish|whale/i.test(name + symbol);
+    const isMeme = /meme|pepe|wojak|chad|npc|moon|rocket|elon|trump|biden|ai|gpt/i.test(name + symbol);
+    const isDefi = /swap|finance|dao|yield|stake|vault|pool|lend|borrow/i.test(name + symbol);
+    const isGaming = /game|play|earn|nft|meta|verse|land|world/i.test(name + symbol);
+
+    if (isAnimal) {
+      lore = `${token.symbol} appears to be an animal-themed memecoin. `;
+      lore += fundamental.uniqueHolders > 500 ? 'It has built a significant holder community. ' : 'Community is still growing. ';
+      narrativeStrength += 20;
+    } else if (isMeme) {
+      lore = `${token.symbol} rides the meme wave with cultural relevance. `;
+      lore += social.trendingScore > 0.5 ? 'Currently trending in crypto spaces. ' : 'Has potential to catch viral momentum. ';
+      narrativeStrength += 25;
+    } else if (isDefi) {
+      lore = `${token.symbol} positions itself as a DeFi protocol. `;
+      lore += fundamental.liquidityLocked ? 'Liquidity is secured. ' : 'Liquidity security unclear. ';
+      narrativeStrength += 15;
+    } else if (isGaming) {
+      lore = `${token.symbol} targets the gaming/NFT narrative. `;
+      narrativeStrength += 18;
+    } else {
+      lore = `${token.symbol} is a unique project in the Solana ecosystem. `;
+      narrativeStrength += 10;
+    }
+
+    // Add market context to lore
+    if (token.priceChange24h > 50) {
+      lore += 'Experiencing explosive growth with strong momentum. ';
+      narrativeStrength += 20;
+    } else if (token.priceChange24h > 10) {
+      lore += 'Showing positive price action recently. ';
+      narrativeStrength += 10;
+    } else if (token.priceChange24h < -20) {
+      lore += 'Recently pulled back, could be a dip-buy opportunity. ';
+    }
+
+    // Add holder dynamics
+    if (fundamental.holderConcentration < 0.3) {
+      lore += 'Healthy distribution across holders. ';
+      narrativeStrength += 15;
+    } else if (fundamental.holderConcentration > 0.6) {
+      lore += 'Concentrated ownership - higher risk. ';
+      narrativeStrength -= 10;
+    }
+
+    // Add smart money insight
+    if (analysis.walletSignals?.some(w => w.isSmartMoney)) {
+      lore += 'Smart money wallets have been detected accumulating. ';
+      narrativeStrength += 25;
+    }
+
+    // Cap narrative strength
+    narrativeStrength = Math.min(100, Math.max(0, narrativeStrength));
+
+    // Determine if it's a buy
+    const isBuy = recommendation === 'strong_buy' || recommendation === 'buy' ||
+      (overallScore >= 55 && confidence >= 0.55 && narrativeStrength >= 30);
+
+    let buyReason = '';
+    let notBuyReason = '';
+
+    if (isBuy) {
+      buyReason = '✅ This token shows promising signals:\n';
+      if (overallScore >= 70) buyReason += '• Strong overall score\n';
+      if (confidence >= 0.7) buyReason += '• High confidence signals\n';
+      if (technical.volumeBreakout) buyReason += '• Volume breakout detected\n';
+      if (fundamental.liquidityLocked) buyReason += '• Liquidity is locked\n';
+      if (narrativeStrength >= 40) buyReason += '• Strong narrative appeal\n';
+      if (analysis.walletSignals?.some(w => w.isSmartMoney)) buyReason += '• Smart money accumulation\n';
+      buyReason += '\n💡 Consider a position with proper risk management.';
+    } else {
+      notBuyReason = '⚠️ Caution advised for these reasons:\n';
+      if (overallScore < 50) notBuyReason += '• Low overall score\n';
+      if (confidence < 0.5) notBuyReason += '• Weak confidence signals\n';
+      if (fundamental.holderConcentration > 0.5) notBuyReason += '• High holder concentration (rug risk)\n';
+      if (!fundamental.liquidityLocked) notBuyReason += '• Liquidity not locked\n';
+      if (fundamental.tokenAge < 1) notBuyReason += '• Very new token (high risk)\n';
+      const rugProb = this.calculateRugProbability(analysis);
+      if (rugProb.percentage > 50) notBuyReason += `• High rug probability (${rugProb.percentage}%)\n`;
+      notBuyReason += '\n💡 Wait for better setup or find safer opportunities.';
+    }
+
+    return {
+      lore,
+      narrativeStrength,
+      isBuy,
+      buyReason: isBuy ? buyReason : undefined,
+      notBuyReason: !isBuy ? notBuyReason : undefined,
+    };
+  }
+
+  // Format lore message
+  private formatLoreMessage(analysis: AnalysisResult, lore: {
+    lore: string;
+    narrativeStrength: number;
+    isBuy: boolean;
+    buyReason?: string;
+    notBuyReason?: string;
+  }): string {
+    const buyEmoji = lore.isBuy ? '🟢' : '🔴';
+    const verdictText = lore.isBuy ? 'BUY SIGNAL' : 'AVOID';
+
+    let message = `\n📖 *Token Lore & Analysis*\n\n`;
+    message += `*${analysis.token.symbol}* - ${analysis.token.name}\n\n`;
+    message += `📜 *Story:* ${lore.lore}\n\n`;
+    message += `📊 *Narrative Strength:* ${lore.narrativeStrength}/100\n\n`;
+    message += `${buyEmoji} *Verdict: ${verdictText}*\n\n`;
+
+    if (lore.isBuy && lore.buyReason) {
+      message += `${lore.buyReason}\n`;
+    } else if (!lore.isBuy && lore.notBuyReason) {
+      message += `${lore.notBuyReason}\n`;
+    }
+
+    return message;
   }
 
   private async handleBuy(msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
@@ -1471,6 +1742,142 @@ Send SOL to this address:
     }
   }
 
+  private async handleConfirmPaymentCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      const pendingPayment = this.pendingPayments.get(userId);
+      if (!pendingPayment) {
+        await this.bot.sendMessage(chatId, '❌ No pending payment found. Use /subscribe first.');
+        return;
+      }
+
+      await this.bot.sendMessage(chatId, '🔄 Checking payment... Please wait.');
+
+      const result = await subscriptionManager.checkAndProcessPayment(
+        userId,
+        pendingPayment.paymentId,
+        pendingPayment.walletAddress
+      );
+
+      if (result.success) {
+        this.pendingPayments.delete(userId);
+        await this.bot.sendMessage(chatId, `
+🎉 *Payment Confirmed!*
+
+${result.message}
+
+✅ You now have full access to Alpha Hunter!
+Use /help to see all available commands.
+        `, { parse_mode: 'Markdown' });
+      } else {
+        await this.bot.sendMessage(chatId, `
+❌ *Payment Not Confirmed*
+
+${result.message}
+
+💡 Make sure you've sent ${subscriptionManager.getPrice()} SOL to:
+\`${pendingPayment.walletAddress}\`
+
+Try again after sending.
+        `, { parse_mode: 'Markdown' });
+      }
+    } catch (error) {
+      logger.error('Error in handleConfirmPaymentCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred. Please try again.');
+    }
+  }
+
+  private async handleHistoryCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      const history = db.getPaperTradeHistory(userId, 20);
+
+      if (history.length === 0) {
+        await this.bot.sendMessage(chatId, '📜 *Trade History*\n\nNo trades recorded yet.', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      let message = `📜 *Trade History (Last 20)*\n\n`;
+
+      for (const trade of history) {
+        const actionEmoji = trade.action === 'buy' ? '🟢' : '🔴';
+        const pnlText = trade.action === 'sell' && trade.pnl !== 0
+          ? ` | PnL: ${trade.pnl > 0 ? '+' : ''}${(trade.pnl_percentage || 0).toFixed(2)}%`
+          : '';
+
+        message += `${actionEmoji} *${trade.action.toUpperCase()}* ${trade.symbol}\n`;
+        message += `  ${trade.amount_sol.toFixed(4)} SOL @ $${trade.price.toFixed(8)}${pnlText}\n`;
+        message += `  ${new Date(trade.timestamp).toLocaleString()}\n\n`;
+      }
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleHistoryCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleRefreshPositionsCallback(chatId: number, userId: number): Promise<void> {
+    try {
+      const openPositions = db.getOpenPositions(userId);
+      const paperBalance = db.getPaperBalance(userId);
+
+      let message = `📊 *Positions (Refreshed)*\n\n`;
+      message += `💰 *Paper Balance:* ${paperBalance.toFixed(4)} SOL\n\n`;
+
+      if (openPositions.length === 0) {
+        message += `📂 *Open Positions:* None`;
+      } else {
+        message += `📂 *Open Positions (${openPositions.length}):*\n\n`;
+
+        let totalValue = 0;
+
+        for (const pos of openPositions.slice(0, 10)) {
+          await tradingEngine.updatePosition(pos);
+          const pnlEmoji = pos.pnl > 0 ? '🟢' : pos.pnl < 0 ? '🔴' : '⚪';
+          message += `${pnlEmoji} *${pos.symbol}*: ${pos.pnl > 0 ? '+' : ''}${pos.pnlPercentage.toFixed(2)}%\n`;
+          totalValue += pos.amount * pos.currentPrice;
+        }
+
+        message += `\n📈 *Account Value:* ${(paperBalance + totalValue).toFixed(4)} SOL`;
+      }
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleRefreshPositionsCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleSetAlertCallback(chatId: number, userId: number, value: number): Promise<void> {
+    try {
+      const threshold = value / 100;
+      db.updateEditableSettings(userId, { alertThreshold: threshold });
+      await this.bot.sendMessage(chatId, `✅ Alert threshold set to ${value}%`);
+    } catch (error) {
+      logger.error('Error in handleSetAlertCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleSetTPValueCallback(chatId: number, userId: number, value: number): Promise<void> {
+    try {
+      db.updateEditableSettings(userId, { takeProfitPercentage: value });
+      await this.bot.sendMessage(chatId, `✅ Take Profit set to ${value}%`);
+    } catch (error) {
+      logger.error('Error in handleSetTPValueCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
+  private async handleSetSLValueCallback(chatId: number, userId: number, value: number): Promise<void> {
+    try {
+      db.updateEditableSettings(userId, { stopLossPercentage: value });
+      await this.bot.sendMessage(chatId, `✅ Stop Loss set to ${value}%`);
+    } catch (error) {
+      logger.error('Error in handleSetSLValueCallback:', error);
+      await this.bot.sendMessage(chatId, '❌ An error occurred.');
+    }
+  }
+
   private async handlePendingAction(chatId: number, userId: number, text: string): Promise<void> {
     try {
       const pending = this.pendingActions.get(userId);
@@ -1950,24 +2357,424 @@ Use /scan ${analysis.token.contractAddress} for full analysis
     }
   }
 
+  // Access control check
+  private async checkAccess(msg: TelegramBot.Message): Promise<boolean> {
+    const userId = msg.from?.id || 0;
+    const username = msg.from?.username;
+
+    // Check if admin (free access)
+    if (username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
+      // Update username in DB
+      db.updateTelegramUsername(userId, username);
+      return true;
+    }
+
+    // Check subscription
+    if (subscriptionManager.hasAccess(userId, username)) {
+      return true;
+    }
+
+    // No access - show subscription message
+    await this.bot.sendMessage(msg.chat.id, `
+🔒 *Access Required*
+
+Welcome to Alpha Hunter! To use this bot, you need a subscription.
+
+💰 *Subscription Price:* ${subscriptionManager.getPrice()} SOL
+⏰ *Duration:* 30 days
+
+Use /subscribe to get started!
+    `, { parse_mode: 'Markdown' });
+
+    return false;
+  }
+
+  // Handle subscription
+  private async handleSubscribe(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+      const username = msg.from?.username;
+
+      // Check if already subscribed or is admin
+      if (subscriptionManager.hasAccess(userId, username)) {
+        const status = subscriptionManager.getSubscriptionStatus(userId);
+
+        if (username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
+          await this.bot.sendMessage(chatId, '✅ You have free admin access!', { parse_mode: 'Markdown' });
+          return;
+        }
+
+        await this.bot.sendMessage(chatId, `
+✅ *You're Already Subscribed!*
+
+⏰ *Expires:* ${status.expiresAt?.toLocaleDateString()}
+📆 *Days Remaining:* ${status.daysRemaining}
+        `, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      // Generate payment wallet
+      const { publicKey, paymentId } = await subscriptionManager.generatePaymentWallet(userId);
+
+      // Store pending payment
+      this.pendingPayments.set(userId, { paymentId, walletAddress: publicKey });
+
+      const subscriptionMessage = `
+🔐 *Subscribe to Alpha Hunter*
+
+💰 *Price:* ${subscriptionManager.getPrice()} SOL
+⏰ *Duration:* 30 days
+🎁 *Access:* All bot features
+
+📥 *Send payment to this address:*
+\`${publicKey}\`
+
+⚠️ *Important:*
+• Send EXACTLY ${subscriptionManager.getPrice()} SOL (or more)
+• Only send SOL (not other tokens)
+• Payment will be auto-forwarded to: \`${subscriptionManager.getMainWallet().substring(0, 8)}...\`
+
+After sending, use /confirmpayment to verify!
+      `.trim();
+
+      await this.bot.sendMessage(chatId, subscriptionMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📋 Copy Payment Address', callback_data: `copy:${publicKey}` }],
+            [{ text: '✅ I\'ve Sent Payment', callback_data: 'confirm_payment' }],
+          ]
+        }
+      });
+    } catch (error) {
+      logger.error('Error in handleSubscribe:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
+    }
+  }
+
+  // Handle payment confirmation
+  private async handleConfirmPayment(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      const pendingPayment = this.pendingPayments.get(userId);
+      if (!pendingPayment) {
+        await this.bot.sendMessage(chatId, '❌ No pending payment found. Use /subscribe first.');
+        return;
+      }
+
+      await this.bot.sendMessage(chatId, '🔄 Checking payment... Please wait.');
+
+      const result = await subscriptionManager.checkAndProcessPayment(
+        userId,
+        pendingPayment.paymentId,
+        pendingPayment.walletAddress
+      );
+
+      if (result.success) {
+        this.pendingPayments.delete(userId);
+        await this.bot.sendMessage(chatId, `
+🎉 *Payment Confirmed!*
+
+${result.message}
+
+✅ You now have full access to Alpha Hunter!
+Use /help to see all available commands.
+        `, { parse_mode: 'Markdown' });
+      } else {
+        await this.bot.sendMessage(chatId, `
+❌ *Payment Not Confirmed*
+
+${result.message}
+
+💡 Make sure you've sent ${subscriptionManager.getPrice()} SOL to:
+\`${pendingPayment.walletAddress}\`
+
+Try /confirmpayment again after sending.
+        `, { parse_mode: 'Markdown' });
+      }
+    } catch (error) {
+      logger.error('Error in handleConfirmPayment:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
+    }
+  }
+
+  // Handle positions view
+  private async handlePositions(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      // Get open positions
+      const openPositions = db.getOpenPositions(userId);
+      const paperBalance = db.getPaperBalance(userId);
+
+      let message = `📊 *Positions Overview*\n\n`;
+      message += `💰 *Paper Balance:* ${paperBalance.toFixed(4)} SOL\n\n`;
+
+      if (openPositions.length === 0) {
+        message += `📂 *Open Positions:* None\n\n`;
+        message += `Start /hunt to find tokens and paper trade automatically!`;
+      } else {
+        message += `📂 *Open Positions (${openPositions.length}):*\n\n`;
+
+        let totalInvested = 0;
+        let totalValue = 0;
+
+        for (const pos of openPositions.slice(0, 10)) {
+          // Update position
+          await tradingEngine.updatePosition(pos);
+
+          const pnlEmoji = pos.pnl > 0 ? '🟢' : pos.pnl < 0 ? '🔴' : '⚪';
+          message += `${pnlEmoji} *${pos.symbol}* (${pos.type})\n`;
+          message += `  Entry: $${pos.entryPrice.toFixed(8)}\n`;
+          message += `  Current: $${pos.currentPrice.toFixed(8)}\n`;
+          message += `  PnL: ${pos.pnl > 0 ? '+' : ''}${pos.pnlPercentage.toFixed(2)}%\n`;
+          message += `  Invested: ${pos.solInvested.toFixed(4)} SOL\n\n`;
+
+          totalInvested += pos.solInvested;
+          totalValue += pos.amount * pos.currentPrice;
+        }
+
+        if (openPositions.length > 10) {
+          message += `... and ${openPositions.length - 10} more positions\n\n`;
+        }
+
+        const totalPnl = totalValue - totalInvested;
+        const totalPnlPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+
+        message += `\n💼 *Total Invested:* ${totalInvested.toFixed(4)} SOL\n`;
+        message += `📈 *Total Value:* ${totalValue.toFixed(4)} SOL\n`;
+        message += `${totalPnl > 0 ? '🟢' : '🔴'} *Total PnL:* ${totalPnl.toFixed(4)} SOL (${totalPnlPct.toFixed(2)}%)\n`;
+      }
+
+      await this.bot.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '📜 Trade History', callback_data: 'show_history' },
+              { text: '🔄 Refresh', callback_data: 'refresh_positions' },
+            ]
+          ]
+        }
+      });
+    } catch (error) {
+      logger.error('Error in handlePositions:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  // Handle trade history
+  private async handleHistory(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      const history = db.getPaperTradeHistory(userId, 20);
+
+      if (history.length === 0) {
+        await this.bot.sendMessage(chatId, '📜 *Trade History*\n\nNo trades recorded yet. Start /hunt to begin trading!', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      let message = `📜 *Trade History (Last 20)*\n\n`;
+
+      for (const trade of history) {
+        const actionEmoji = trade.action === 'buy' ? '🟢' : '🔴';
+        const pnlText = trade.action === 'sell' && trade.pnl !== 0
+          ? ` | PnL: ${trade.pnl > 0 ? '+' : ''}${trade.pnl_percentage?.toFixed(2) || 0}%`
+          : '';
+
+        message += `${actionEmoji} *${trade.action.toUpperCase()}* ${trade.symbol}\n`;
+        message += `  ${trade.amount_sol.toFixed(4)} SOL @ $${trade.price.toFixed(8)}${pnlText}\n`;
+        message += `  ${new Date(trade.timestamp).toLocaleString()}\n\n`;
+      }
+
+      await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleHistory:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  // Handle edit settings
+  private async handleEditSettings(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      const settings = db.getUserSettings(userId);
+      if (!settings) {
+        await this.bot.sendMessage(chatId, '❌ User not found. Send /start first.');
+        return;
+      }
+
+      const message = `
+⚙️ *Edit Your Settings*
+
+Current values:
+• Alert Threshold: ${((settings.alertThreshold || 0.3) * 100).toFixed(0)}%
+• Take Profit: ${settings.takeProfitPercentage || 30}%
+• Stop Loss: ${settings.stopLossPercentage || 15}%
+• Default Trade Size: ${settings.defaultTradeSize || 0.35} SOL
+• High Confidence Trade Size: ${settings.highConfidenceTradeSize || 0.5} SOL
+
+*Commands to edit:*
+• /setalert <percentage> - Set alert threshold (e.g., /setalert 30)
+• /setpresetparam tp <percentage> - Set take profit
+• /setpresetparam sl <percentage> - Set stop loss
+• /setpresetparam trade <amount> - Set default trade size
+• /setpresetparam hctrade <amount> - Set high confidence trade size
+      `.trim();
+
+      await this.bot.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '📊 30% Alert', callback_data: 'set_alert:30' },
+              { text: '📊 50% Alert', callback_data: 'set_alert:50' },
+            ],
+            [
+              { text: '🎯 50% TP', callback_data: 'set_tp:50' },
+              { text: '🎯 100% TP', callback_data: 'set_tp:100' },
+            ],
+            [
+              { text: '🛡️ 15% SL', callback_data: 'set_sl:15' },
+              { text: '🛡️ 25% SL', callback_data: 'set_sl:25' },
+            ],
+          ]
+        }
+      });
+    } catch (error) {
+      logger.error('Error in handleEditSettings:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  // Handle set alert threshold
+  private async handleSetAlert(msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      const percentage = match?.[1] ? parseFloat(match[1]) : null;
+
+      if (percentage === null || isNaN(percentage) || percentage < 0 || percentage > 100) {
+        await this.bot.sendMessage(chatId, '❌ Invalid percentage. Use: /setalert <0-100>\nExample: /setalert 30');
+        return;
+      }
+
+      const threshold = percentage / 100;
+      db.updateEditableSettings(userId, { alertThreshold: threshold });
+
+      await this.bot.sendMessage(chatId, `✅ Alert threshold set to ${percentage}%`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleSetAlert:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  // Handle set preset parameters
+  private async handleSetPresetParam(msg: TelegramBot.Message, match: RegExpExecArray | null): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      const param = match?.[1]?.toLowerCase();
+      const value = match?.[2] ? parseFloat(match[2]) : null;
+
+      if (!param || value === null || isNaN(value)) {
+        await this.bot.sendMessage(chatId, `
+❌ Invalid format. Use:
+• /setpresetparam tp <percentage> - Take Profit
+• /setpresetparam sl <percentage> - Stop Loss
+• /setpresetparam trade <sol_amount> - Trade Size
+• /setpresetparam hctrade <sol_amount> - High Confidence Trade
+        `, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      let updateField: any = {};
+      let confirmMsg = '';
+
+      switch (param) {
+        case 'tp':
+          updateField = { takeProfitPercentage: value };
+          confirmMsg = `Take Profit set to ${value}%`;
+          break;
+        case 'sl':
+          updateField = { stopLossPercentage: value };
+          confirmMsg = `Stop Loss set to ${value}%`;
+          break;
+        case 'trade':
+          updateField = { defaultTradeSize: value };
+          confirmMsg = `Default trade size set to ${value} SOL`;
+          break;
+        case 'hctrade':
+          updateField = { highConfidenceTradeSize: value };
+          confirmMsg = `High confidence trade size set to ${value} SOL`;
+          break;
+        default:
+          await this.bot.sendMessage(chatId, '❌ Unknown parameter. Use tp, sl, trade, or hctrade.');
+          return;
+      }
+
+      db.updateEditableSettings(userId, updateField);
+      await this.bot.sendMessage(chatId, `✅ ${confirmMsg}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleSetPresetParam:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
+  // Handle reset paper balance
+  private async handleResetBalance(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const userId = msg.from?.id || 0;
+
+      tradingEngine.resetPaperBalance(userId);
+
+      await this.bot.sendMessage(chatId, `
+✅ *Paper Balance Reset!*
+
+Your paper trading balance has been reset to 100 SOL.
+
+Use /hunt to start trading again!
+      `, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleResetBalance:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+    }
+  }
+
   async start(): Promise<void> {
     try {
       // Register bot commands with Telegram
       await this.bot.setMyCommands([
         { command: 'start', description: 'Start the bot and see welcome message' },
         { command: 'help', description: 'Show all available commands' },
+        { command: 'subscribe', description: 'Subscribe to get full access' },
         { command: 'hunt', description: 'Start hunting for runners' },
         { command: 'stop', description: 'Stop hunting' },
         { command: 'scan', description: 'Analyze a specific token' },
         { command: 'buy', description: 'Buy a token' },
         { command: 'sell', description: 'Close a position' },
-        { command: 'portfolio', description: 'View your positions' },
+        { command: 'portfolio', description: 'View portfolio summary' },
+        { command: 'positions', description: 'View open positions' },
+        { command: 'history', description: 'View trade history' },
         { command: 'preset', description: 'View or change trading preset' },
+        { command: 'editsettings', description: 'Edit your settings' },
         { command: 'settings', description: 'View your settings' },
         { command: 'patterns', description: 'View pattern performance' },
         { command: 'learning', description: 'View AI learning report' },
         { command: 'autotrade', description: 'Toggle auto-trading' },
         { command: 'papermode', description: 'Toggle paper trading' },
+        { command: 'resetbalance', description: 'Reset paper balance to 100 SOL' },
         { command: 'wallet', description: 'View your trading wallet' },
         { command: 'createwallet', description: 'Create a new trading wallet' },
         { command: 'balance', description: 'Check your wallet balance' },
@@ -1975,7 +2782,7 @@ Use /scan ${analysis.token.contractAddress} for full analysis
         { command: 'favorites', description: 'View your favorite tokens' },
         { command: 'dcaorders', description: 'View active DCA orders' },
         { command: 'tpslorders', description: 'View active TP/SL orders' },
-        { command: 'papertrades', description: 'View paper trade portfolio with thesis' },
+        { command: 'papertrades', description: 'View paper trade portfolio' },
       ]);
 
       logger.info('✅ Bot commands registered with Telegram');

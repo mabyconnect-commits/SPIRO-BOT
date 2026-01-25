@@ -5,6 +5,15 @@ import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger';
 
+// Admin telegram username with free access
+const FREE_ADMIN_USERNAME = 'mabyconnect2000';
+// Subscription price in SOL
+const SUBSCRIPTION_PRICE_SOL = 0.5;
+// Subscription duration in days
+const SUBSCRIPTION_DURATION_DAYS = 30;
+// Main wallet to receive payments
+const MAIN_WALLET = 'EAi7pueCbhkioMb8kHtib2hrVWvTkhkPpNq4saHQfhFy';
+
 class DatabaseManager {
   private db: Database.Database;
 
@@ -19,16 +28,65 @@ class DatabaseManager {
   }
 
   private initialize() {
-    // Users table
+    // Users table with extended fields
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
+        telegram_username TEXT,
         preset TEXT DEFAULT 'balanced',
         paper_trading INTEGER DEFAULT 1,
         auto_trade INTEGER DEFAULT 0,
-        alert_threshold REAL DEFAULT 0.7,
+        alert_threshold REAL DEFAULT 0.3,
         notifications_enabled INTEGER DEFAULT 1,
+        paper_balance REAL DEFAULT 100.0,
+        default_trade_size REAL DEFAULT 0.35,
+        high_confidence_trade_size REAL DEFAULT 0.5,
+        take_profit_percentage REAL DEFAULT 30.0,
+        stop_loss_percentage REAL DEFAULT 15.0,
+        is_subscribed INTEGER DEFAULT 0,
+        subscription_expires_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Add columns if they don't exist (for existing databases)
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN telegram_username TEXT`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN paper_balance REAL DEFAULT 100.0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN default_trade_size REAL DEFAULT 0.35`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN high_confidence_trade_size REAL DEFAULT 0.5`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN take_profit_percentage REAL DEFAULT 30.0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN stop_loss_percentage REAL DEFAULT 15.0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN is_subscribed INTEGER DEFAULT 0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN subscription_expires_at DATETIME`);
+    } catch (e) { /* Column exists */ }
+
+    // Subscription payments table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS subscription_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        payment_wallet TEXT,
+        payment_wallet_encrypted_key TEXT,
+        amount_sol REAL,
+        status TEXT DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        confirmed_at DATETIME,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
       )
     `);
 
@@ -179,7 +237,75 @@ class DatabaseManager {
       )
     `);
 
+    // Token lore/stories table for narrative analysis
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS token_lore (
+        contract_address TEXT PRIMARY KEY,
+        symbol TEXT,
+        name TEXT,
+        lore TEXT,
+        narrative_strength INTEGER DEFAULT 0,
+        is_buy INTEGER DEFAULT 0,
+        buy_reason TEXT,
+        not_buy_reason TEXT,
+        analyzed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Paper trade history with detailed tracking
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS paper_trade_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        position_id TEXT,
+        contract_address TEXT,
+        symbol TEXT,
+        action TEXT,
+        amount_sol REAL,
+        token_amount REAL,
+        price REAL,
+        paper_balance_before REAL,
+        paper_balance_after REAL,
+        pnl REAL,
+        pnl_percentage REAL,
+        confidence REAL,
+        narrative_strength INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+      )
+    `);
+
+    // Scanned tokens tracking for mandatory buy signals
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS scanned_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contract_address TEXT,
+        symbol TEXT,
+        name TEXT,
+        score REAL,
+        confidence REAL,
+        recommendation TEXT,
+        scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        buy_signal_sent INTEGER DEFAULT 0
+      )
+    `);
+
     logger.info('Database initialized successfully');
+  }
+
+  // Get main wallet for payments
+  getMainWallet(): string {
+    return MAIN_WALLET;
+  }
+
+  // Get subscription price
+  getSubscriptionPrice(): number {
+    return SUBSCRIPTION_PRICE_SOL;
+  }
+
+  // Get free admin username
+  getFreeAdminUsername(): string {
+    return FREE_ADMIN_USERNAME;
   }
 
   getUserSettings(userId: number): UserSettings | null {
@@ -190,13 +316,291 @@ class DatabaseManager {
 
     return {
       userId: row.user_id,
+      telegramUsername: row.telegram_username,
       preset: row.preset,
       paperTrading: row.paper_trading === 1,
       autoTrade: row.auto_trade === 1,
-      alertThreshold: row.alert_threshold,
+      alertThreshold: row.alert_threshold || 0.3,
       notificationsEnabled: row.notifications_enabled === 1,
+      paperBalance: row.paper_balance || 100.0,
+      defaultTradeSize: row.default_trade_size || 0.35,
+      highConfidenceTradeSize: row.high_confidence_trade_size || 0.5,
+      takeProfitPercentage: row.take_profit_percentage || 30.0,
+      stopLossPercentage: row.stop_loss_percentage || 15.0,
+      isSubscribed: row.is_subscribed === 1,
+      subscriptionExpiresAt: row.subscription_expires_at ? new Date(row.subscription_expires_at) : undefined,
       customPatterns: [],
     };
+  }
+
+  // Check if user has access (is admin or has valid subscription)
+  hasAccess(userId: number, telegramUsername?: string): boolean {
+    // Check if it's the free admin
+    if (telegramUsername && telegramUsername.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
+      return true;
+    }
+
+    const settings = this.getUserSettings(userId);
+    if (!settings) return false;
+
+    // Check username in settings
+    if (settings.telegramUsername && settings.telegramUsername.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
+      return true;
+    }
+
+    // Check subscription
+    if (settings.isSubscribed && settings.subscriptionExpiresAt) {
+      return new Date() < settings.subscriptionExpiresAt;
+    }
+
+    return false;
+  }
+
+  // Update user's telegram username
+  updateTelegramUsername(userId: number, username: string): void {
+    const stmt = this.db.prepare('UPDATE users SET telegram_username = ? WHERE user_id = ?');
+    stmt.run(username, userId);
+  }
+
+  // Update paper balance
+  updatePaperBalance(userId: number, newBalance: number): void {
+    const stmt = this.db.prepare('UPDATE users SET paper_balance = ? WHERE user_id = ?');
+    stmt.run(newBalance, userId);
+  }
+
+  // Get paper balance
+  getPaperBalance(userId: number): number {
+    const stmt = this.db.prepare('SELECT paper_balance FROM users WHERE user_id = ?');
+    const row = stmt.get(userId) as any;
+    return row?.paper_balance || 100.0;
+  }
+
+  // Update editable settings
+  updateEditableSettings(userId: number, settings: {
+    alertThreshold?: number;
+    takeProfitPercentage?: number;
+    stopLossPercentage?: number;
+    defaultTradeSize?: number;
+    highConfidenceTradeSize?: number;
+  }): void {
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (settings.alertThreshold !== undefined) {
+      updates.push('alert_threshold = ?');
+      values.push(settings.alertThreshold);
+    }
+    if (settings.takeProfitPercentage !== undefined) {
+      updates.push('take_profit_percentage = ?');
+      values.push(settings.takeProfitPercentage);
+    }
+    if (settings.stopLossPercentage !== undefined) {
+      updates.push('stop_loss_percentage = ?');
+      values.push(settings.stopLossPercentage);
+    }
+    if (settings.defaultTradeSize !== undefined) {
+      updates.push('default_trade_size = ?');
+      values.push(settings.defaultTradeSize);
+    }
+    if (settings.highConfidenceTradeSize !== undefined) {
+      updates.push('high_confidence_trade_size = ?');
+      values.push(settings.highConfidenceTradeSize);
+    }
+
+    if (updates.length > 0) {
+      values.push(userId);
+      const stmt = this.db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE user_id = ?`);
+      stmt.run(...values);
+    }
+  }
+
+  // Create subscription payment record
+  createSubscriptionPayment(userId: number, paymentWallet: string, encryptedKey: string): number {
+    const stmt = this.db.prepare(`
+      INSERT INTO subscription_payments (user_id, payment_wallet, payment_wallet_encrypted_key, amount_sol, status)
+      VALUES (?, ?, ?, ?, 'pending')
+    `);
+    const result = stmt.run(userId, paymentWallet, encryptedKey, SUBSCRIPTION_PRICE_SOL);
+    return result.lastInsertRowid as number;
+  }
+
+  // Get pending payment for user
+  getPendingPayment(userId: number): any | null {
+    const stmt = this.db.prepare(`
+      SELECT * FROM subscription_payments
+      WHERE user_id = ? AND status = 'pending'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+    return stmt.get(userId) as any;
+  }
+
+  // Confirm subscription payment
+  confirmSubscriptionPayment(paymentId: number, userId: number): void {
+    // Update payment status
+    const updatePayment = this.db.prepare(`
+      UPDATE subscription_payments
+      SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `);
+    updatePayment.run(paymentId);
+
+    // Update user subscription
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + SUBSCRIPTION_DURATION_DAYS);
+
+    const updateUser = this.db.prepare(`
+      UPDATE users
+      SET is_subscribed = 1, subscription_expires_at = ?
+      WHERE user_id = ?
+    `);
+    updateUser.run(expiresAt.toISOString(), userId);
+  }
+
+  // Save token lore
+  saveTokenLore(data: {
+    contractAddress: string;
+    symbol: string;
+    name: string;
+    lore: string;
+    narrativeStrength: number;
+    isBuy: boolean;
+    buyReason?: string;
+    notBuyReason?: string;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO token_lore
+      (contract_address, symbol, name, lore, narrative_strength, is_buy, buy_reason, not_buy_reason, analyzed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `);
+    stmt.run(
+      data.contractAddress,
+      data.symbol,
+      data.name,
+      data.lore,
+      data.narrativeStrength,
+      data.isBuy ? 1 : 0,
+      data.buyReason || null,
+      data.notBuyReason || null
+    );
+  }
+
+  // Get token lore
+  getTokenLore(contractAddress: string): any | null {
+    const stmt = this.db.prepare('SELECT * FROM token_lore WHERE contract_address = ?');
+    return stmt.get(contractAddress) as any;
+  }
+
+  // Record paper trade in history
+  recordPaperTradeHistory(data: {
+    userId: number;
+    positionId: string;
+    contractAddress: string;
+    symbol: string;
+    action: 'buy' | 'sell';
+    amountSol: number;
+    tokenAmount: number;
+    price: number;
+    paperBalanceBefore: number;
+    paperBalanceAfter: number;
+    pnl?: number;
+    pnlPercentage?: number;
+    confidence?: number;
+    narrativeStrength?: number;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO paper_trade_history
+      (user_id, position_id, contract_address, symbol, action, amount_sol, token_amount, price,
+       paper_balance_before, paper_balance_after, pnl, pnl_percentage, confidence, narrative_strength)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      data.userId,
+      data.positionId,
+      data.contractAddress,
+      data.symbol,
+      data.action,
+      data.amountSol,
+      data.tokenAmount,
+      data.price,
+      data.paperBalanceBefore,
+      data.paperBalanceAfter,
+      data.pnl || 0,
+      data.pnlPercentage || 0,
+      data.confidence || 0,
+      data.narrativeStrength || 0
+    );
+  }
+
+  // Get paper trade history for user
+  getPaperTradeHistory(userId: number, limit: number = 50): any[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM paper_trade_history
+      WHERE user_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `);
+    return stmt.all(userId, limit) as any[];
+  }
+
+  // Save scanned token for mandatory buy signal logic
+  saveScannedToken(data: {
+    contractAddress: string;
+    symbol: string;
+    name: string;
+    score: number;
+    confidence: number;
+    recommendation: string;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO scanned_tokens (contract_address, symbol, name, score, confidence, recommendation)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      data.contractAddress,
+      data.symbol,
+      data.name,
+      data.score,
+      data.confidence,
+      data.recommendation
+    );
+  }
+
+  // Get best scanned token in last N minutes that hasn't had buy signal
+  getBestScannedTokenSince(minutes: number): any | null {
+    const stmt = this.db.prepare(`
+      SELECT * FROM scanned_tokens
+      WHERE scanned_at >= datetime('now', '-' || ? || ' minutes')
+      AND buy_signal_sent = 0
+      ORDER BY score DESC, confidence DESC
+      LIMIT 1
+    `);
+    return stmt.get(minutes) as any;
+  }
+
+  // Mark token as having buy signal sent
+  markBuySignalSent(contractAddress: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE scanned_tokens SET buy_signal_sent = 1 WHERE contract_address = ?
+    `);
+    stmt.run(contractAddress);
+  }
+
+  // Get last buy signal time
+  getLastBuySignalTime(): Date | null {
+    const stmt = this.db.prepare(`
+      SELECT MAX(scanned_at) as last_signal FROM scanned_tokens WHERE buy_signal_sent = 1
+    `);
+    const row = stmt.get() as any;
+    return row?.last_signal ? new Date(row.last_signal) : null;
+  }
+
+  // Clean old scanned tokens (older than 24 hours)
+  cleanOldScannedTokens(): void {
+    const stmt = this.db.prepare(`
+      DELETE FROM scanned_tokens WHERE scanned_at < datetime('now', '-24 hours')
+    `);
+    stmt.run();
   }
 
   createUser(userId: number): void {

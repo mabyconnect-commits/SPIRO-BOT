@@ -70,15 +70,28 @@ export class TradingEngine {
   }
 
   /**
-   * Execute paper trading buy
+   * Execute paper trading buy with balance tracking
    */
   private async executePaperBuy(
     analysis: AnalysisResult,
     solAmount: number,
     userId: number
-  ): Promise<TradePosition> {
+  ): Promise<TradePosition | null> {
+    // Get current paper balance
+    const currentBalance = db.getPaperBalance(userId);
+
+    // Check if user has enough balance
+    if (currentBalance < solAmount) {
+      logger.info(`❌ Insufficient paper balance: ${currentBalance.toFixed(4)} SOL < ${solAmount} SOL`);
+      return null;
+    }
+
     const tokenPrice = analysis.token.price;
     const tokenAmount = (solAmount / tokenPrice) * 0.99; // Account for slippage
+
+    // Deduct from paper balance
+    const newBalance = currentBalance - solAmount;
+    db.updatePaperBalance(userId, newBalance);
 
     const position: TradePosition = {
       id: crypto.randomUUID(),
@@ -97,8 +110,23 @@ export class TradingEngine {
 
     db.savePosition(position);
 
+    // Record in paper trade history
+    db.recordPaperTradeHistory({
+      userId,
+      positionId: position.id,
+      contractAddress: analysis.token.contractAddress,
+      symbol: analysis.token.symbol,
+      action: 'buy',
+      amountSol: solAmount,
+      tokenAmount,
+      price: tokenPrice,
+      paperBalanceBefore: currentBalance,
+      paperBalanceAfter: newBalance,
+      confidence: analysis.confidence,
+    });
+
     logger.info(
-      `📝 PAPER BUY: ${solAmount} SOL → ${tokenAmount.toFixed(2)} ${analysis.token.symbol} @ $${tokenPrice.toFixed(8)}`
+      `📝 PAPER BUY: ${solAmount} SOL → ${tokenAmount.toFixed(2)} ${analysis.token.symbol} @ $${tokenPrice.toFixed(8)} | Balance: ${newBalance.toFixed(4)} SOL`
     );
 
     return position;
@@ -202,11 +230,12 @@ export class TradingEngine {
    */
   async sell(
     position: TradePosition,
-    paperTrade: boolean = config.trading.paperTrading
+    paperTrade: boolean = config.trading.paperTrading,
+    userId: number = 0
   ): Promise<boolean> {
     try {
       if (paperTrade || position.type === 'paper') {
-        return this.executePaperSell(position);
+        return this.executePaperSell(position, userId);
       } else {
         return this.executeRealSell(position);
       }
@@ -217,18 +246,42 @@ export class TradingEngine {
   }
 
   /**
-   * Execute paper trading sell
+   * Execute paper trading sell with balance tracking
    */
-  private async executePaperSell(position: TradePosition): Promise<boolean> {
+  private async executePaperSell(position: TradePosition, userId: number = 0): Promise<boolean> {
     position.status = 'closed';
     position.closedAt = new Date();
 
+    // Calculate current value and add back to paper balance
+    const currentValue = position.amount * position.currentPrice;
+    const currentBalance = db.getPaperBalance(userId);
+    const newBalance = currentBalance + currentValue;
+
+    // Update paper balance
+    db.updatePaperBalance(userId, newBalance);
+
     db.savePosition(position);
+
+    // Record in paper trade history
+    db.recordPaperTradeHistory({
+      userId,
+      positionId: position.id,
+      contractAddress: position.contractAddress,
+      symbol: position.symbol,
+      action: 'sell',
+      amountSol: currentValue,
+      tokenAmount: position.amount,
+      price: position.currentPrice,
+      paperBalanceBefore: currentBalance,
+      paperBalanceAfter: newBalance,
+      pnl: position.pnl,
+      pnlPercentage: position.pnlPercentage,
+    });
 
     const pnlEmoji = position.pnl > 0 ? '🟢' : '🔴';
     logger.info(
       `📝 PAPER SELL: ${position.amount.toFixed(2)} ${position.symbol} @ $${position.currentPrice.toFixed(8)} | ` +
-      `${pnlEmoji} PnL: ${position.pnl.toFixed(4)} SOL (${position.pnlPercentage.toFixed(2)}%)`
+      `${pnlEmoji} PnL: ${position.pnl.toFixed(4)} SOL (${position.pnlPercentage.toFixed(2)}%) | Balance: ${newBalance.toFixed(4)} SOL`
     );
 
     return true;
@@ -366,12 +419,17 @@ export class TradingEngine {
    */
   async getPortfolioSummary(userId: number = 0): Promise<string> {
     const positions = db.getOpenPositions(userId);
+    const paperBalance = db.getPaperBalance(userId);
+
+    let summary = `📊 **Portfolio Summary**\n\n`;
+    summary += `💰 *Paper Balance:* ${paperBalance.toFixed(4)} SOL\n\n`;
 
     if (positions.length === 0) {
-      return '📊 No open positions';
+      summary += `📂 *Open Positions:* None\n`;
+      return summary;
     }
 
-    let summary = `📊 **Portfolio (${positions.length} positions)**\n\n`;
+    summary += `📂 *Open Positions (${positions.length}):*\n\n`;
 
     let totalInvested = 0;
     let totalValue = 0;
@@ -379,25 +437,46 @@ export class TradingEngine {
     for (const position of positions) {
       await this.updatePosition(position);
 
-      const pnlEmoji = position.pnl > 0 ? '🟢' : '🔴';
-      summary += `**${position.symbol}**\n`;
+      const pnlEmoji = position.pnl > 0 ? '🟢' : position.pnl < 0 ? '🔴' : '⚪';
+      summary += `**${position.symbol}** (${position.type.toUpperCase()})\n`;
       summary += `• Entry: $${position.entryPrice.toFixed(8)}\n`;
       summary += `• Current: $${position.currentPrice.toFixed(8)}\n`;
-      summary += `• ${pnlEmoji} PnL: ${position.pnlPercentage.toFixed(2)}%\n\n`;
+      summary += `• Invested: ${position.solInvested.toFixed(4)} SOL\n`;
+      summary += `• ${pnlEmoji} PnL: ${position.pnl > 0 ? '+' : ''}${position.pnlPercentage.toFixed(2)}%\n\n`;
 
       totalInvested += position.solInvested;
       totalValue += position.amount * position.currentPrice;
     }
 
     const totalPnl = totalValue - totalInvested;
-    const totalPnlPercentage = (totalPnl / totalInvested) * 100;
+    const totalPnlPercentage = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
 
-    summary += `\n💰 **Total**\n`;
-    summary += `• Invested: ${totalInvested.toFixed(2)} SOL\n`;
-    summary += `• Value: ${totalValue.toFixed(2)} SOL\n`;
-    summary += `• PnL: ${totalPnl.toFixed(2)} SOL (${totalPnlPercentage.toFixed(2)}%)\n`;
+    const totalPnlEmoji = totalPnl > 0 ? '🟢' : totalPnl < 0 ? '🔴' : '⚪';
+
+    summary += `\n💼 **Positions Total**\n`;
+    summary += `• Invested: ${totalInvested.toFixed(4)} SOL\n`;
+    summary += `• Current Value: ${totalValue.toFixed(4)} SOL\n`;
+    summary += `• ${totalPnlEmoji} PnL: ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL (${totalPnlPercentage.toFixed(2)}%)\n\n`;
+
+    summary += `📈 **Account Value:** ${(paperBalance + totalValue).toFixed(4)} SOL`;
 
     return summary;
+  }
+
+  /**
+   * Get paper balance for a user
+   */
+  getPaperBalance(userId: number = 0): number {
+    return db.getPaperBalance(userId);
+  }
+
+  /**
+   * Reset paper balance to initial value
+   */
+  resetPaperBalance(userId: number = 0): void {
+    const initialBalance = config.paperTrading?.initialBalance || 100;
+    db.updatePaperBalance(userId, initialBalance);
+    logger.info(`Paper balance reset to ${initialBalance} SOL for user ${userId}`);
   }
 }
 

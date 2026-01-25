@@ -21,10 +21,23 @@ export const config = {
     maxPositionSizeSol: parseFloat(process.env.MAX_POSITION_SIZE_SOL || '1.0'),
     slippageBps: parseInt(process.env.SLIPPAGE_BPS || '100'),
   },
+  paperTrading: {
+    initialBalance: parseFloat(process.env.PAPER_INITIAL_BALANCE || '100'),
+    defaultTradeSize: parseFloat(process.env.PAPER_DEFAULT_TRADE_SIZE || '0.35'),
+    highConfidenceTradeSize: parseFloat(process.env.PAPER_HIGH_CONFIDENCE_TRADE_SIZE || '0.5'),
+    highConfidenceThreshold: parseFloat(process.env.HIGH_CONFIDENCE_THRESHOLD || '0.75'),
+  },
   scanner: {
-    scanIntervalMs: parseInt(process.env.SCAN_INTERVAL_MS || '60000'),
+    scanIntervalMs: parseInt(process.env.SCAN_INTERVAL_MS || '120000'), // 2 minutes default
     minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '10000'),
     minVolume24hUsd: parseFloat(process.env.MIN_VOLUME_24H_USD || '50000'),
+    mandatoryBuySignalIntervalMs: parseInt(process.env.MANDATORY_BUY_SIGNAL_INTERVAL_MS || '300000'), // 5 minutes
+  },
+  subscription: {
+    freeAdminUsername: process.env.FREE_ADMIN_USERNAME || 'mabyconnect2000',
+    priceSol: parseFloat(process.env.SUBSCRIPTION_PRICE_SOL || '0.5'),
+    durationDays: parseInt(process.env.SUBSCRIPTION_DURATION_DAYS || '30'),
+    mainWallet: process.env.MAIN_WALLET || 'EAi7pueCbhkioMb8kHtib2hrVWvTkhkPpNq4saHQfhFy',
   },
   learning: {
     enabled: process.env.LEARNING_ENABLED === 'true',
