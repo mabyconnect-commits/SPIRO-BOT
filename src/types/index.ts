@@ -107,12 +107,42 @@ export interface TradingPreset {
 
 export interface UserSettings {
   userId: number;
+  telegramUsername?: string;
   preset: string;
   paperTrading: boolean;
   autoTrade: boolean;
   alertThreshold: number;
   notificationsEnabled: boolean;
+  paperBalance: number;
+  defaultTradeSize: number;
+  highConfidenceTradeSize: number;
+  takeProfitPercentage: number;
+  stopLossPercentage: number;
+  isSubscribed: boolean;
+  subscriptionExpiresAt?: Date;
   customPatterns: string[];
+}
+
+export interface TokenLore {
+  contractAddress: string;
+  symbol: string;
+  name: string;
+  lore: string;
+  narrativeStrength: number;
+  isBuy: boolean;
+  buyReason?: string;
+  notBuyReason?: string;
+  analyzedAt: Date;
+}
+
+export interface SubscriptionPayment {
+  id: number;
+  userId: number;
+  paymentWallet: string;
+  amountSol: number;
+  status: 'pending' | 'confirmed' | 'failed';
+  createdAt: Date;
+  confirmedAt?: Date;
 }
 
 export interface ScannerConfig {

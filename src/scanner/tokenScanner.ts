@@ -11,13 +11,17 @@ export class TokenScanner {
   private isScanning: boolean = false;
   private scanInterval: NodeJS.Timeout | null = null;
   private paperTradeInterval: NodeJS.Timeout | null = null;
+  private mandatoryBuySignalInterval: NodeJS.Timeout | null = null;
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
-  private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string }) => void> = [];
+  private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string; score?: number; confidence?: number }) => void> = [];
   private buySignalCallbacks: Array<(analysis: AnalysisResult) => void> = [];
+  private forcedBuySignalCallbacks: Array<(analysis: AnalysisResult, reason: string) => void> = [];
   private scannedTokens: Set<string> = new Set(); // Track scanned tokens to avoid duplicates
+  private lastBuySignalTime: Date = new Date();
   private stats = {
     tokensScanned: 0,
     alertsTriggered: 0,
+    buySignalsSent: 0,
     lastScanTime: Date.now(),
   };
 
@@ -81,6 +85,13 @@ export class TokenScanner {
    */
   onBuySignal(callback: (analysis: AnalysisResult) => void): void {
     this.buySignalCallbacks.push(callback);
+  }
+
+  /**
+   * Register callback for forced/mandatory buy signals
+   */
+  onForcedBuySignal(callback: (analysis: AnalysisResult, reason: string) => void): void {
+    this.forcedBuySignalCallbacks.push(callback);
   }
 
   /**
@@ -209,10 +220,39 @@ export class TokenScanner {
         `Recommendation: ${analysis.recommendation}`
       );
 
+      // Save scanned token for mandatory buy signal logic
+      db.saveScannedToken({
+        contractAddress: analysis.token.contractAddress,
+        symbol: analysis.token.symbol,
+        name: analysis.token.name,
+        score: analysis.overallScore,
+        confidence: analysis.confidence,
+        recommendation: analysis.recommendation,
+      });
+
+      // Notify with token info (name, symbol, score)
+      this.notifyScan(
+        contractAddress,
+        analysis.token.name,
+        analysis.token.symbol,
+        analysis.overallScore,
+        analysis.confidence
+      );
+
+      // Determine trade size based on confidence
+      const userSettings = db.getUserSettings(0);
+      const defaultTradeSize = userSettings?.defaultTradeSize || config.paperTrading.defaultTradeSize;
+      const highConfidenceTradeSize = userSettings?.highConfidenceTradeSize || config.paperTrading.highConfidenceTradeSize;
+      const highConfidenceThreshold = config.paperTrading.highConfidenceThreshold;
+
+      // Use higher trade size for high confidence tokens with strong narrative
+      const isHighConfidence = analysis.confidence >= highConfidenceThreshold && analysis.overallScore >= 70;
+      const tradeSize = isHighConfidence ? highConfidenceTradeSize : defaultTradeSize;
+
       // PAPER TRADE ALL SCANNED TOKENS (not just buy signals)
       // This allows us to learn from all patterns, including failed ones
-      logger.info(`📝 Paper trading ${analysis.token.symbol} for learning...`);
-      await tradingEngine.buy(analysis, 0.1, 0, true); // Small amount (0.1 SOL) for tracking
+      logger.info(`📝 Paper trading ${analysis.token.symbol} with ${tradeSize} SOL (${isHighConfidence ? 'HIGH CONFIDENCE' : 'standard'})...`);
+      await tradingEngine.buy(analysis, tradeSize, 0, true);
 
       // Check if this is a good token (potential 2x or better)
       const isPotentialRunner = this.isPotentialRunner(analysis);
@@ -221,6 +261,9 @@ export class TokenScanner {
       if (isPotentialRunner) {
         logger.info(`🚨 BUY SIGNAL: ${analysis.token.symbol} shows 2x+ potential!`);
         this.sendBuySignal(analysis);
+        this.lastBuySignalTime = new Date();
+        this.stats.buySignalsSent++;
+        db.markBuySignalSent(analysis.token.contractAddress);
       }
 
       // Send alert to users for buy/strong_buy recommendations
@@ -347,13 +390,93 @@ export class TokenScanner {
   /**
    * Notify scan callbacks that a token is being scanned
    */
-  private notifyScan(contractAddress: string): void {
+  private notifyScan(contractAddress: string, name?: string, symbol?: string, score?: number, confidence?: number): void {
     for (const callback of this.scanNotifyCallbacks) {
       try {
-        callback({ address: contractAddress });
+        callback({ address: contractAddress, name, symbol, score, confidence });
       } catch (error) {
         logger.error('Error in scan notify callback:', error);
       }
+    }
+  }
+
+  /**
+   * Send forced buy signal (for mandatory 5-min signals)
+   */
+  private sendForcedBuySignal(analysis: AnalysisResult, reason: string): void {
+    this.stats.buySignalsSent++;
+    this.lastBuySignalTime = new Date();
+    db.markBuySignalSent(analysis.token.contractAddress);
+
+    for (const callback of this.forcedBuySignalCallbacks) {
+      try {
+        callback(analysis, reason);
+      } catch (error) {
+        logger.error('Error in forced buy signal callback:', error);
+      }
+    }
+
+    // Also send regular buy signal
+    this.sendBuySignal(analysis);
+  }
+
+  /**
+   * Check and send mandatory buy signal if 5 minutes passed without one
+   */
+  private async checkMandatoryBuySignal(): Promise<void> {
+    const now = new Date();
+    const timeSinceLastSignal = now.getTime() - this.lastBuySignalTime.getTime();
+    const mandatoryIntervalMs = config.scanner.mandatoryBuySignalIntervalMs || 300000; // 5 minutes
+
+    if (timeSinceLastSignal >= mandatoryIntervalMs) {
+      logger.info('🚨 5 minutes passed without buy signal - finding best token...');
+
+      // Get best scanned token in last 5 minutes
+      const bestToken = db.getBestScannedTokenSince(5);
+
+      if (bestToken) {
+        logger.info(`📈 Best token found: ${bestToken.symbol} (Score: ${bestToken.score})`);
+
+        // Re-analyze the token for fresh data
+        const analysis = await tokenAnalyzer.analyzeToken(bestToken.contract_address);
+
+        if (analysis) {
+          this.sendForcedBuySignal(analysis, 'Mandatory 5-minute signal - Best available token');
+        }
+      } else {
+        logger.info('No suitable tokens found in last 5 minutes for mandatory signal');
+      }
+    }
+  }
+
+  /**
+   * Start mandatory buy signal checker
+   */
+  startMandatoryBuySignalChecker(): void {
+    if (this.mandatoryBuySignalInterval) {
+      return;
+    }
+
+    // Check every minute
+    this.mandatoryBuySignalInterval = setInterval(async () => {
+      try {
+        await this.checkMandatoryBuySignal();
+      } catch (error) {
+        logger.error('Error in mandatory buy signal checker:', error);
+      }
+    }, 60000); // 1 minute
+
+    logger.info('🔔 Mandatory buy signal checker started (every 5 min)');
+  }
+
+  /**
+   * Stop mandatory buy signal checker
+   */
+  stopMandatoryBuySignalChecker(): void {
+    if (this.mandatoryBuySignalInterval) {
+      clearInterval(this.mandatoryBuySignalInterval);
+      this.mandatoryBuySignalInterval = null;
+      logger.info('Mandatory buy signal checker stopped');
     }
   }
 
@@ -402,7 +525,13 @@ export class TokenScanner {
 
     logger.info('🤖 Starting automated paper trading');
 
-    // Run every 2 minutes (120000ms)
+    // Clean old scanned tokens
+    db.cleanOldScannedTokens();
+
+    // Get scan interval (default 2 minutes = 120000ms)
+    const scanIntervalMs = config.scanner.scanIntervalMs || 120000;
+
+    // Run at configured interval
     this.paperTradeInterval = setInterval(async () => {
       try {
         logger.info('🔍 Automated paper trade scan starting...');
@@ -410,10 +539,16 @@ export class TokenScanner {
       } catch (error) {
         logger.error('Error in automated paper trading:', error);
       }
-    }, 120000);
+    }, scanIntervalMs);
+
+    // Start mandatory buy signal checker (every 5 min)
+    this.startMandatoryBuySignalChecker();
 
     // Run initial scan immediately
     this.scan().catch(error => logger.error('Initial automated scan error:', error));
+
+    logger.info(`📊 Scanning every ${scanIntervalMs / 1000} seconds`);
+    logger.info('🔔 Mandatory buy signal every 5 minutes enabled');
   }
 
   /**
@@ -425,6 +560,8 @@ export class TokenScanner {
       this.paperTradeInterval = null;
       logger.info('Automated paper trading stopped');
     }
+
+    this.stopMandatoryBuySignalChecker();
   }
 
   private sleep(ms: number): Promise<void> {
