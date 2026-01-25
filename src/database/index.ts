@@ -290,6 +290,52 @@ class DatabaseManager {
       )
     `);
 
+    // Alpha picks table - tokens with score >= 29 and successful 100x tokens
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS alpha_picks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contract_address TEXT UNIQUE,
+        symbol TEXT,
+        name TEXT,
+        initial_score REAL,
+        initial_price REAL,
+        current_price REAL,
+        peak_price REAL,
+        peak_multiplier REAL DEFAULT 1.0,
+        is_100x INTEGER DEFAULT 0,
+        pump_reason TEXT,
+        alpha_reason TEXT,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // User-specific scanning sessions
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS user_scan_sessions (
+        user_id INTEGER PRIMARY KEY,
+        is_scanning INTEGER DEFAULT 0,
+        scan_started_at DATETIME,
+        tokens_scanned INTEGER DEFAULT 0,
+        last_scan_time DATETIME,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+      )
+    `);
+
+    // Add columns to users table for per-user paper trading
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN total_paper_trades INTEGER DEFAULT 0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN paper_pnl_total REAL DEFAULT 0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN paper_winners INTEGER DEFAULT 0`);
+    } catch (e) { /* Column exists */ }
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN paper_losers INTEGER DEFAULT 0`);
+    } catch (e) { /* Column exists */ }
+
     logger.info('Database initialized successfully');
   }
 
@@ -933,6 +979,129 @@ class DatabaseManager {
     `);
 
     return stmt.get(userId);
+  }
+
+  // Alpha picks methods
+  saveAlphaPick(data: {
+    contractAddress: string;
+    symbol: string;
+    name: string;
+    initialScore: number;
+    initialPrice: number;
+    alphaReason: string;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO alpha_picks
+      (contract_address, symbol, name, initial_score, initial_price, current_price, alpha_reason, added_at, last_updated)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `);
+    stmt.run(
+      data.contractAddress,
+      data.symbol,
+      data.name,
+      data.initialScore,
+      data.initialPrice,
+      data.initialPrice,
+      data.alphaReason
+    );
+  }
+
+  updateAlphaPickPrice(contractAddress: string, currentPrice: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE alpha_picks
+      SET current_price = ?,
+          peak_price = CASE WHEN ? > COALESCE(peak_price, 0) THEN ? ELSE peak_price END,
+          peak_multiplier = CASE WHEN initial_price > 0 AND ? > COALESCE(peak_price, 0)
+            THEN ? / initial_price ELSE peak_multiplier END,
+          last_updated = CURRENT_TIMESTAMP
+      WHERE contract_address = ?
+    `);
+    stmt.run(currentPrice, currentPrice, currentPrice, currentPrice, currentPrice, contractAddress);
+  }
+
+  mark100xToken(contractAddress: string, pumpReason: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE alpha_picks
+      SET is_100x = 1, pump_reason = ?, last_updated = CURRENT_TIMESTAMP
+      WHERE contract_address = ?
+    `);
+    stmt.run(pumpReason, contractAddress);
+  }
+
+  getAlphaPicks(limit: number = 50): any[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM alpha_picks
+      ORDER BY added_at DESC
+      LIMIT ?
+    `);
+    return stmt.all(limit) as any[];
+  }
+
+  get100xTokens(): any[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM alpha_picks
+      WHERE is_100x = 1
+      ORDER BY peak_multiplier DESC
+    `);
+    return stmt.all() as any[];
+  }
+
+  getAlphaPickByAddress(contractAddress: string): any | null {
+    const stmt = this.db.prepare(`
+      SELECT * FROM alpha_picks WHERE contract_address = ?
+    `);
+    return stmt.get(contractAddress) as any;
+  }
+
+  // User scan session methods
+  startUserScanSession(userId: number): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO user_scan_sessions
+      (user_id, is_scanning, scan_started_at, tokens_scanned, last_scan_time)
+      VALUES (?, 1, CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP)
+    `);
+    stmt.run(userId);
+  }
+
+  stopUserScanSession(userId: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE user_scan_sessions
+      SET is_scanning = 0
+      WHERE user_id = ?
+    `);
+    stmt.run(userId);
+  }
+
+  isUserScanning(userId: number): boolean {
+    const stmt = this.db.prepare(`
+      SELECT is_scanning FROM user_scan_sessions WHERE user_id = ?
+    `);
+    const row = stmt.get(userId) as any;
+    return row?.is_scanning === 1;
+  }
+
+  incrementUserTokensScanned(userId: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE user_scan_sessions
+      SET tokens_scanned = tokens_scanned + 1, last_scan_time = CURRENT_TIMESTAMP
+      WHERE user_id = ?
+    `);
+    stmt.run(userId);
+  }
+
+  getUserScanStats(userId: number): any {
+    const stmt = this.db.prepare(`
+      SELECT * FROM user_scan_sessions WHERE user_id = ?
+    `);
+    return stmt.get(userId) as any;
+  }
+
+  getAllActiveScanners(): number[] {
+    const stmt = this.db.prepare(`
+      SELECT user_id FROM user_scan_sessions WHERE is_scanning = 1
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map(r => r.user_id);
   }
 
   close(): void {

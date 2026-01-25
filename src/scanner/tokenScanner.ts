@@ -1,4 +1,4 @@
-import { dexScreener } from '../services/apiClients';
+import { dexScreener, jupiter } from '../services/apiClients';
 import tokenAnalyzer from '../analyzer/tokenAnalyzer';
 import tradingEngine from '../trading/tradingEngine';
 import patternLearner from '../learning/patternLearner';
@@ -7,21 +7,32 @@ import logger from '../utils/logger';
 import { AnalysisResult } from '../types';
 import db from '../database';
 
+// Constants for Alpha picks and scoring
+const ALPHA_SCORE_THRESHOLD = 29; // Score >= 29 is considered Alpha
+const BUY_SIGNAL_SCORE_THRESHOLD = 30; // Score >= 30 triggers buy signal
+const MOONSHOT_MULTIPLIER = 100; // 100x gain threshold
+
 export class TokenScanner {
   private isScanning: boolean = false;
   private scanInterval: NodeJS.Timeout | null = null;
   private paperTradeInterval: NodeJS.Timeout | null = null;
   private mandatoryBuySignalInterval: NodeJS.Timeout | null = null;
+  private alphaMonitorInterval: NodeJS.Timeout | null = null;
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
-  private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string; score?: number; confidence?: number }) => void> = [];
+  private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string; score?: number; confidence?: number; isAlpha?: boolean }) => void> = [];
   private buySignalCallbacks: Array<(analysis: AnalysisResult) => void> = [];
   private forcedBuySignalCallbacks: Array<(analysis: AnalysisResult, reason: string) => void> = [];
+  private alphaPickCallbacks: Array<(analysis: AnalysisResult, reason: string) => void> = [];
+  private hundredXCallbacks: Array<(tokenData: any, pumpReason: string) => void> = [];
   private scannedTokens: Set<string> = new Set(); // Track scanned tokens to avoid duplicates
+  private userScanIntervals: Map<number, NodeJS.Timeout> = new Map(); // Per-user scan intervals
+  private userScannedTokens: Map<number, Set<string>> = new Map(); // Per-user scanned tokens
   private lastBuySignalTime: Date = new Date();
   private stats = {
     tokensScanned: 0,
     alertsTriggered: 0,
     buySignalsSent: 0,
+    alphaPicks: 0,
     lastScanTime: Date.now(),
   };
 
@@ -76,8 +87,22 @@ export class TokenScanner {
   /**
    * Register callback for scan notifications
    */
-  onScanNotify(callback: (tokenInfo: { address: string; name?: string; symbol?: string }) => void): void {
+  onScanNotify(callback: (tokenInfo: { address: string; name?: string; symbol?: string; score?: number; confidence?: number; isAlpha?: boolean }) => void): void {
     this.scanNotifyCallbacks.push(callback);
+  }
+
+  /**
+   * Register callback for alpha picks
+   */
+  onAlphaPick(callback: (analysis: AnalysisResult, reason: string) => void): void {
+    this.alphaPickCallbacks.push(callback);
+  }
+
+  /**
+   * Register callback for 100x tokens
+   */
+  on100xToken(callback: (tokenData: any, pumpReason: string) => void): void {
+    this.hundredXCallbacks.push(callback);
   }
 
   /**
@@ -208,16 +233,21 @@ export class TokenScanner {
   /**
    * Analyze a token and take action
    */
-  private async analyzeAndAct(contractAddress: string): Promise<void> {
+  private async analyzeAndAct(contractAddress: string, userId: number = 0): Promise<void> {
     try {
       const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
 
       if (!analysis) return;
 
+      // Check if this is an Alpha pick (score >= 29)
+      const isAlpha = analysis.overallScore >= ALPHA_SCORE_THRESHOLD;
+      const isBuySignal = analysis.overallScore >= BUY_SIGNAL_SCORE_THRESHOLD;
+
       logger.info(
         `${analysis.token.symbol}: Score ${analysis.overallScore.toFixed(0)}, ` +
         `Confidence ${(analysis.confidence * 100).toFixed(0)}%, ` +
-        `Recommendation: ${analysis.recommendation}`
+        `Recommendation: ${analysis.recommendation}` +
+        `${isAlpha ? ' ⭐ ALPHA' : ''}`
       );
 
       // Save scanned token for mandatory buy signal logic
@@ -230,36 +260,56 @@ export class TokenScanner {
         recommendation: analysis.recommendation,
       });
 
-      // Notify with token info (name, symbol, score)
+      // If it's an Alpha pick, save to alpha_picks table
+      if (isAlpha) {
+        const alphaReason = this.generateAlphaReason(analysis);
+        db.saveAlphaPick({
+          contractAddress: analysis.token.contractAddress,
+          symbol: analysis.token.symbol,
+          name: analysis.token.name,
+          initialScore: analysis.overallScore,
+          initialPrice: analysis.token.price,
+          alphaReason,
+        });
+        this.stats.alphaPicks++;
+        logger.info(`⭐ ALPHA PICK: ${analysis.token.symbol} added with score ${analysis.overallScore.toFixed(0)}`);
+
+        // Notify alpha pick callbacks
+        this.sendAlphaPick(analysis, alphaReason);
+      }
+
+      // Notify with token info (name, symbol, score, isAlpha)
       this.notifyScan(
         contractAddress,
         analysis.token.name,
         analysis.token.symbol,
         analysis.overallScore,
-        analysis.confidence
+        analysis.confidence,
+        isAlpha
       );
 
-      // Determine trade size based on confidence
-      const userSettings = db.getUserSettings(0);
+      // Determine trade size based on confidence and alpha status
+      const userSettings = db.getUserSettings(userId);
       const defaultTradeSize = userSettings?.defaultTradeSize || config.paperTrading.defaultTradeSize;
       const highConfidenceTradeSize = userSettings?.highConfidenceTradeSize || config.paperTrading.highConfidenceTradeSize;
       const highConfidenceThreshold = config.paperTrading.highConfidenceThreshold;
 
-      // Use higher trade size for high confidence tokens with strong narrative
-      const isHighConfidence = analysis.confidence >= highConfidenceThreshold && analysis.overallScore >= 70;
+      // Use higher trade size for Alpha picks and high confidence tokens
+      const isHighConfidence = (analysis.confidence >= highConfidenceThreshold && analysis.overallScore >= 70) || isAlpha;
       const tradeSize = isHighConfidence ? highConfidenceTradeSize : defaultTradeSize;
 
       // PAPER TRADE ALL SCANNED TOKENS (not just buy signals)
       // This allows us to learn from all patterns, including failed ones
-      logger.info(`📝 Paper trading ${analysis.token.symbol} with ${tradeSize} SOL (${isHighConfidence ? 'HIGH CONFIDENCE' : 'standard'})...`);
-      await tradingEngine.buy(analysis, tradeSize, 0, true);
+      logger.info(`📝 Paper trading ${analysis.token.symbol} with ${tradeSize} SOL (${isAlpha ? 'ALPHA' : isHighConfidence ? 'HIGH CONFIDENCE' : 'standard'})...`);
+      const position = await tradingEngine.buy(analysis, tradeSize, userId, true);
 
-      // Check if this is a good token (potential 2x or better)
-      const isPotentialRunner = this.isPotentialRunner(analysis);
+      if (position) {
+        logger.info(`✅ Paper trade executed: ${position.amount.toFixed(2)} ${analysis.token.symbol} @ $${position.entryPrice.toFixed(8)}`);
+      }
 
-      // Send buy signal if it's a good token
-      if (isPotentialRunner) {
-        logger.info(`🚨 BUY SIGNAL: ${analysis.token.symbol} shows 2x+ potential!`);
+      // Send buy signal if score >= 30 (new threshold)
+      if (isBuySignal) {
+        logger.info(`🚨 BUY SIGNAL: ${analysis.token.symbol} score ${analysis.overallScore.toFixed(0)} >= ${BUY_SIGNAL_SCORE_THRESHOLD}!`);
         this.sendBuySignal(analysis);
         this.lastBuySignalTime = new Date();
         this.stats.buySignalsSent++;
@@ -267,7 +317,7 @@ export class TokenScanner {
       }
 
       // Send alert to users for buy/strong_buy recommendations
-      if (analysis.recommendation === 'strong_buy' || analysis.recommendation === 'buy') {
+      if (analysis.recommendation === 'strong_buy' || analysis.recommendation === 'buy' || isBuySignal) {
         this.sendAlert(analysis);
 
         // Auto-trade for users who have it enabled
@@ -275,6 +325,36 @@ export class TokenScanner {
       }
     } catch (error) {
       logger.error(`Error analyzing ${contractAddress}:`, error);
+    }
+  }
+
+  /**
+   * Generate reason why a token is an Alpha pick
+   */
+  private generateAlphaReason(analysis: AnalysisResult): string {
+    const reasons: string[] = [];
+
+    if (analysis.overallScore >= 50) reasons.push('High overall score');
+    if (analysis.confidence >= 0.7) reasons.push('Strong confidence');
+    if (analysis.technical.volumeBreakout) reasons.push('Volume breakout detected');
+    if (analysis.fundamental.liquidityLocked) reasons.push('Liquidity locked');
+    if (analysis.technical.priceAction === 'bullish') reasons.push('Bullish price action');
+    if (analysis.fundamental.uniqueHolders > 500) reasons.push('Good holder count');
+    if (analysis.walletSignals?.some(w => w.isSmartMoney)) reasons.push('Smart money detected');
+
+    return reasons.length > 0 ? reasons.join(', ') : 'Score threshold met';
+  }
+
+  /**
+   * Send alpha pick notification
+   */
+  private sendAlphaPick(analysis: AnalysisResult, reason: string): void {
+    for (const callback of this.alphaPickCallbacks) {
+      try {
+        callback(analysis, reason);
+      } catch (error) {
+        logger.error('Error in alpha pick callback:', error);
+      }
     }
   }
 
@@ -390,10 +470,10 @@ export class TokenScanner {
   /**
    * Notify scan callbacks that a token is being scanned
    */
-  private notifyScan(contractAddress: string, name?: string, symbol?: string, score?: number, confidence?: number): void {
+  private notifyScan(contractAddress: string, name?: string, symbol?: string, score?: number, confidence?: number, isAlpha?: boolean): void {
     for (const callback of this.scanNotifyCallbacks) {
       try {
-        callback({ address: contractAddress, name, symbol, score, confidence });
+        callback({ address: contractAddress, name, symbol, score, confidence, isAlpha });
       } catch (error) {
         logger.error('Error in scan notify callback:', error);
       }
@@ -562,6 +642,238 @@ export class TokenScanner {
     }
 
     this.stopMandatoryBuySignalChecker();
+  }
+
+  /**
+   * Start scanning for a specific user (independent scanning)
+   */
+  startUserScanning(userId: number): boolean {
+    if (this.userScanIntervals.has(userId)) {
+      logger.warn(`User ${userId} already has scanning active`);
+      return false;
+    }
+
+    // Initialize user's scanned tokens set
+    if (!this.userScannedTokens.has(userId)) {
+      this.userScannedTokens.set(userId, new Set());
+    }
+
+    // Mark user as scanning in DB
+    db.startUserScanSession(userId);
+
+    const scanIntervalMs = config.scanner.scanIntervalMs || 120000;
+
+    // Create user-specific scan interval
+    const interval = setInterval(async () => {
+      try {
+        await this.scanForUser(userId);
+      } catch (error) {
+        logger.error(`Error in user ${userId} scan:`, error);
+      }
+    }, scanIntervalMs);
+
+    this.userScanIntervals.set(userId, interval);
+
+    // Run initial scan
+    this.scanForUser(userId).catch(error => logger.error(`Initial scan error for user ${userId}:`, error));
+
+    logger.info(`🔍 Started independent scanning for user ${userId}`);
+    return true;
+  }
+
+  /**
+   * Stop scanning for a specific user
+   */
+  stopUserScanning(userId: number): boolean {
+    const interval = this.userScanIntervals.get(userId);
+    if (interval) {
+      clearInterval(interval);
+      this.userScanIntervals.delete(userId);
+      db.stopUserScanSession(userId);
+      logger.info(`🛑 Stopped scanning for user ${userId}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Check if a user is currently scanning
+   */
+  isUserScanning(userId: number): boolean {
+    return this.userScanIntervals.has(userId) || db.isUserScanning(userId);
+  }
+
+  /**
+   * Scan tokens for a specific user
+   */
+  private async scanForUser(userId: number): Promise<void> {
+    try {
+      logger.info(`🔍 Scanning for user ${userId}...`);
+
+      const trendingTokens = await this.getTrendingTokens();
+      const userScanned = this.userScannedTokens.get(userId) || new Set();
+
+      for (const tokenAddress of trendingTokens) {
+        // Skip if already scanned by this user
+        if (userScanned.has(tokenAddress)) {
+          continue;
+        }
+
+        userScanned.add(tokenAddress);
+        db.incrementUserTokensScanned(userId);
+
+        // Analyze and execute paper trade for this user
+        await this.analyzeAndAct(tokenAddress, userId);
+        this.stats.tokensScanned++;
+
+        // Small delay to avoid rate limits
+        await this.sleep(1000);
+      }
+
+      this.stats.lastScanTime = Date.now();
+      logger.info(`✅ Scan complete for user ${userId}`);
+    } catch (error) {
+      logger.error(`Scan error for user ${userId}:`, error);
+    }
+  }
+
+  /**
+   * Get user scan statistics
+   */
+  getUserStats(userId: number): any {
+    return db.getUserScanStats(userId);
+  }
+
+  /**
+   * Start monitoring alpha picks for 100x gains
+   */
+  startAlphaMonitoring(): void {
+    if (this.alphaMonitorInterval) {
+      return;
+    }
+
+    // Check alpha picks every 5 minutes for price updates
+    this.alphaMonitorInterval = setInterval(async () => {
+      try {
+        await this.monitorAlphaPicks();
+      } catch (error) {
+        logger.error('Error monitoring alpha picks:', error);
+      }
+    }, 300000); // 5 minutes
+
+    logger.info('🔍 Alpha picks monitoring started');
+  }
+
+  /**
+   * Stop monitoring alpha picks
+   */
+  stopAlphaMonitoring(): void {
+    if (this.alphaMonitorInterval) {
+      clearInterval(this.alphaMonitorInterval);
+      this.alphaMonitorInterval = null;
+      logger.info('Alpha picks monitoring stopped');
+    }
+  }
+
+  /**
+   * Monitor alpha picks for 100x gains
+   */
+  private async monitorAlphaPicks(): Promise<void> {
+    const alphaPicks = db.getAlphaPicks(100);
+
+    for (const pick of alphaPicks) {
+      try {
+        // Get current price
+        const currentPrice = await jupiter.getTokenPrice(pick.contract_address);
+        if (!currentPrice || currentPrice <= 0) continue;
+
+        // Update price in database
+        db.updateAlphaPickPrice(pick.contract_address, currentPrice);
+
+        // Check for 100x
+        if (pick.initial_price > 0) {
+          const multiplier = currentPrice / pick.initial_price;
+
+          if (multiplier >= MOONSHOT_MULTIPLIER && !pick.is_100x) {
+            const pumpReason = await this.analyze100xPumpReason(pick, currentPrice, multiplier);
+
+            // Mark as 100x and save pump reason
+            db.mark100xToken(pick.contract_address, pumpReason);
+
+            logger.info(`🚀🚀🚀 100X DETECTED: ${pick.symbol} went from $${pick.initial_price.toFixed(10)} to $${currentPrice.toFixed(10)} (${multiplier.toFixed(0)}x)!`);
+
+            // Notify callbacks
+            this.send100xNotification(pick, pumpReason);
+          }
+        }
+      } catch (error) {
+        logger.error(`Error monitoring alpha pick ${pick.symbol}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Analyze why a token pumped 100x
+   */
+  private async analyze100xPumpReason(pick: any, currentPrice: number, multiplier: number): Promise<string> {
+    const reasons: string[] = [];
+
+    // Get fresh analysis
+    const analysis = await tokenAnalyzer.analyzeToken(pick.contract_address);
+
+    if (analysis) {
+      // Technical reasons
+      if (analysis.technical.volumeBreakout) reasons.push('Massive volume breakout');
+      if (analysis.technical.priceAction === 'bullish') reasons.push('Strong bullish momentum');
+
+      // Fundamental reasons
+      if (analysis.fundamental.uniqueHolders > 1000) reasons.push('Large holder base expansion');
+      if (analysis.fundamental.liquidityLocked) reasons.push('Liquidity secured');
+
+      // Smart money
+      if (analysis.walletSignals?.some(w => w.isSmartMoney)) reasons.push('Smart money accumulation');
+
+      // Social
+      if (analysis.social.trendingScore > 0.7) reasons.push('Viral social momentum');
+    }
+
+    // Original alpha reason
+    if (pick.alpha_reason) {
+      reasons.push(`Initial alpha: ${pick.alpha_reason}`);
+    }
+
+    // Score range analysis
+    reasons.push(`Initial score: ${pick.initial_score?.toFixed(0) || 'N/A'}`);
+    reasons.push(`Peak multiplier: ${multiplier.toFixed(0)}x`);
+
+    return reasons.join(' | ') || 'Unknown factors';
+  }
+
+  /**
+   * Send 100x notification
+   */
+  private send100xNotification(tokenData: any, pumpReason: string): void {
+    for (const callback of this.hundredXCallbacks) {
+      try {
+        callback(tokenData, pumpReason);
+      } catch (error) {
+        logger.error('Error in 100x callback:', error);
+      }
+    }
+  }
+
+  /**
+   * Get alpha picks
+   */
+  getAlphaPicks(limit: number = 50): any[] {
+    return db.getAlphaPicks(limit);
+  }
+
+  /**
+   * Get 100x tokens
+   */
+  get100xTokens(): any[] {
+    return db.get100xTokens();
   }
 
   private sleep(ms: number): Promise<void> {
