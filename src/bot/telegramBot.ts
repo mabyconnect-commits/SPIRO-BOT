@@ -135,7 +135,10 @@ export class AlphaHunterBot {
           const text = msg.text.trim();
           const userId = msg.from?.id || 0;
 
-          logger.info(`Received message from user ${userId}: ${text.substring(0, 50)}...`);
+          const username = msg.from?.username;
+          const userDisplay = username ? `@${username}` : `User #${userId}`;
+
+          logger.info(`Received message from ${userDisplay}: ${text.substring(0, 50)}...`);
 
           // Check if user is setting up a PIN (allow this without subscription)
           if (this.pendingPinSetup.has(userId)) {
@@ -150,10 +153,65 @@ export class AlphaHunterBot {
           }
 
           // CHECK SUBSCRIPTION FOR ALL OTHER FEATURES
-          const hasAccess = await this.checkAccess(msg);
-          if (!hasAccess) {
-            return; // Block unsubscribed users
+          // Only @mabyconnect2000 gets free access
+          const isAdmin = username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase();
+
+          if (!isAdmin) {
+            // Check subscription status
+            const subscriptionStatus = subscriptionManager.getSubscriptionStatus(userId);
+
+            if (!subscriptionStatus.isActive) {
+              const settings = db.getUserSettings(userId);
+              const isContractAddress = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text);
+              const actionDesc = isContractAddress ? `Analyze token: ${text.substring(0, 8)}...` : text.substring(0, 30);
+
+              logger.info(`❌ Message ACCESS DENIED for ${userDisplay} - Attempted: ${actionDesc}`);
+
+              let rejectionMessage = '';
+              if (settings?.subscriptionExpiresAt) {
+                const expiredDate = new Date(settings.subscriptionExpiresAt).toLocaleDateString();
+                rejectionMessage = `
+🔒 *Access Denied*
+
+👤 *User:* ${userDisplay}
+📝 *Attempted:* \`${actionDesc}\`
+
+⚠️ *Your subscription has EXPIRED*
+📅 Expired on: ${expiredDate}
+
+👉 Use /subscribe to renew!
+                `.trim();
+              } else {
+                rejectionMessage = `
+🔒 *Access Denied*
+
+👤 *User:* ${userDisplay}
+📝 *Attempted:* \`${actionDesc}\`
+
+❌ *You don't have a subscription*
+
+Only @${FREE_ADMIN_USERNAME} has free access. All other users need an active subscription.
+
+💰 *Price:* ${subscriptionManager.getPrice()} SOL
+⏰ *Duration:* 30 days
+
+👉 Use /subscribe to get access!
+                `.trim();
+              }
+
+              await this.bot.sendMessage(msg.chat.id, rejectionMessage, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '💳 Subscribe Now', callback_data: 'subscribe_now' }]
+                  ]
+                }
+              });
+              return;
+            }
           }
+
+          logger.info(`✅ Message access granted for ${userDisplay}`);
 
           // Check if user has pending actions (TP, SL, DCA setup)
           if (this.pendingActions.has(userId)) {
@@ -192,20 +250,65 @@ export class AlphaHunterBot {
         const isPublicCallback = publicCallbacks.some(cb => data.startsWith(cb) || data === cb);
 
         // CHECK SUBSCRIPTION for all non-public callbacks
+        // Only @mabyconnect2000 gets free access
         if (!isPublicCallback) {
           const username = query.from.username;
           const userId = query.from.id;
+          const userDisplay = username ? `@${username}` : `User #${userId}`;
+          const actionAttempted = data.split(':')[0] || 'action';
 
-          // Check if admin
-          if (!(username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase())) {
-            // Check subscription
-            if (!subscriptionManager.hasAccess(userId, username)) {
+          logger.info(`Callback access check for ${userDisplay} - Action: ${actionAttempted}`);
+
+          // Check if admin - ONLY @mabyconnect2000
+          const isAdmin = username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase();
+
+          if (!isAdmin) {
+            // NOT admin - check subscription
+            const subscriptionStatus = subscriptionManager.getSubscriptionStatus(userId);
+
+            if (!subscriptionStatus.isActive) {
+              logger.info(`❌ Callback ACCESS DENIED for ${userDisplay} - Attempted: ${actionAttempted}`);
+
+              // Get settings to check if expired vs never subscribed
+              const settings = db.getUserSettings(userId);
+              let alertMessage = '';
+
+              if (settings?.subscriptionExpiresAt) {
+                alertMessage = `🔒 Subscription expired! @${username || userId}, please renew with /subscribe`;
+              } else {
+                alertMessage = `🔒 ${userDisplay}, you need a subscription! Only @${FREE_ADMIN_USERNAME} has free access. Use /subscribe`;
+              }
+
               await this.bot.answerCallbackQuery(query.id, {
-                text: '🔒 Subscribe first! Use /subscribe',
+                text: alertMessage,
                 show_alert: true
               });
+
+              // Also send a detailed message
+              await this.bot.sendMessage(chatId, `
+🔒 *Access Denied*
+
+👤 *User:* ${userDisplay}
+📝 *Attempted:* \`${actionAttempted}\`
+
+❌ You don't have an active subscription.
+Only @${FREE_ADMIN_USERNAME} has free access.
+
+👉 Use /subscribe to get access!
+              `.trim(), {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '💳 Subscribe Now', callback_data: 'subscribe_now' }]
+                  ]
+                }
+              });
               return;
+            } else {
+              logger.info(`✅ Callback access granted for ${userDisplay} - ${subscriptionStatus.daysRemaining} days remaining`);
             }
+          } else {
+            logger.info(`✅ Admin callback access for @${username}`);
           }
         }
 
@@ -2614,34 +2717,70 @@ Use /scan ${analysis.token.contractAddress} for full analysis
   }
 
   // Access control check - STRICT: blocks all non-subscribers
+  // Only @mabyconnect2000 gets free access
   private async checkAccess(msg: TelegramBot.Message): Promise<boolean> {
     const userId = msg.from?.id || 0;
     const username = msg.from?.username;
+    const commandUsed = msg.text?.split(' ')[0] || 'this feature';
 
-    logger.info(`Access check for user ${userId} (${username || 'no username'})`);
+    logger.info(`Access check for user ${userId} (@${username || 'no_username'}) - Command: ${commandUsed}`);
 
-    // Check if admin (free access) - ONLY the exact admin username
+    // Check if admin (free access) - ONLY @mabyconnect2000
     if (username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
-      logger.info(`Admin access granted for ${username}`);
+      logger.info(`✅ Admin access granted for @${username}`);
       db.updateTelegramUsername(userId, username);
       return true;
     }
 
-    // Check subscription - must have is_subscribed = 1 AND valid expiry
-    const hasAccess = subscriptionManager.hasAccess(userId, username);
+    // NOT the admin - must check subscription
+    logger.info(`User @${username || 'unknown'} is NOT the admin. Checking subscription...`);
 
-    if (hasAccess) {
-      logger.info(`Subscription access granted for user ${userId}`);
+    // Get detailed subscription status
+    const subscriptionStatus = subscriptionManager.getSubscriptionStatus(userId);
+    const settings = db.getUserSettings(userId);
+
+    // Check if subscription is active
+    if (subscriptionStatus.isActive && subscriptionStatus.daysRemaining && subscriptionStatus.daysRemaining > 0) {
+      logger.info(`✅ Subscription access granted for user ${userId} (@${username || 'unknown'}) - ${subscriptionStatus.daysRemaining} days remaining`);
       return true;
     }
 
-    // NO ACCESS - block and show subscription message
-    logger.info(`ACCESS DENIED for user ${userId} - no subscription`);
+    // NO ACCESS - determine if expired or never subscribed
+    logger.info(`❌ ACCESS DENIED for user ${userId} (@${username || 'unknown'}) - Attempted: ${commandUsed}`);
 
-    await this.bot.sendMessage(msg.chat.id, `
-🔒 *Subscription Required*
+    let rejectionMessage = '';
+    const userDisplay = username ? `@${username}` : `User #${userId}`;
 
-You need an active subscription to use this feature.
+    if (settings?.subscriptionExpiresAt) {
+      // Had a subscription but it expired
+      const expiredDate = new Date(settings.subscriptionExpiresAt).toLocaleDateString();
+      rejectionMessage = `
+🔒 *Access Denied*
+
+👤 *User:* ${userDisplay}
+📝 *Attempted:* \`${commandUsed}\`
+
+⚠️ *Your subscription has EXPIRED*
+📅 Expired on: ${expiredDate}
+
+To continue using Alpha Hunter, please renew your subscription.
+
+💰 *Price:* ${subscriptionManager.getPrice()} SOL
+⏰ *Duration:* 30 days
+
+👉 Use /subscribe to renew!
+      `.trim();
+    } else {
+      // Never subscribed
+      rejectionMessage = `
+🔒 *Access Denied*
+
+👤 *User:* ${userDisplay}
+📝 *Attempted:* \`${commandUsed}\`
+
+❌ *You don't have a subscription*
+
+Only @${FREE_ADMIN_USERNAME} has free access. All other users need an active subscription.
 
 💰 *Price:* ${subscriptionManager.getPrice()} SOL
 ⏰ *Duration:* 30 days
@@ -2653,8 +2792,11 @@ You need an active subscription to use this feature.
 • 🚀 100x moonshot tracking
 • 🤖 AI buy signals
 
-👉 Use /subscribe to get started!
-    `, {
+👉 Use /subscribe to get access!
+      `.trim();
+    }
+
+    await this.bot.sendMessage(msg.chat.id, rejectionMessage, {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
