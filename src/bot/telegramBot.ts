@@ -764,8 +764,56 @@ Type /help for all commands or paste a token address!
 
   private async handleHelp(msg: TelegramBot.Message): Promise<void> {
     try {
-      logger.info(`User ${msg.from?.id} requested help`);
+      const userId = msg.from?.id || 0;
+      const username = msg.from?.username;
 
+      logger.info(`User ${userId} requested help`);
+
+      // Check if user has access
+      const hasAccess = subscriptionManager.hasAccess(userId, username);
+      const isAdmin = username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase();
+
+      if (!hasAccess && !isAdmin) {
+        // Show limited help for non-subscribers
+        const lockedHelp = `
+📚 *Alpha Hunter - Help*
+
+🔒 *SUBSCRIPTION REQUIRED*
+
+You need an active subscription to use this bot.
+
+💰 *Price:* ${subscriptionManager.getPrice()} SOL
+⏰ *Duration:* 30 days
+
+*Available Commands:*
+• /start - Welcome message
+• /help - This help message
+• /subscribe - Get subscription
+• /confirmpayment - Verify payment
+
+👉 Use /subscribe to unlock all features!
+
+✨ *With subscription you get:*
+• Auto token scanning
+• Paper & real trading
+• Alpha picks detection
+• 100x moonshot tracking
+• AI-powered signals
+• And much more!
+        `.trim();
+
+        await this.bot.sendMessage(msg.chat.id, lockedHelp, {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '💳 Subscribe Now', callback_data: 'subscribe_now' }]
+            ]
+          }
+        });
+        return;
+      }
+
+      // Full help for subscribers
       const help = `
 📚 *Alpha Hunter Commands*
 
@@ -779,6 +827,12 @@ Type /help for all commands or paste a token address!
 • /buy \\[CA\\] \\[amount\\] → Buy token
 • /sell \\[position\\] → Sell position
 • /portfolio → View positions
+• /papertrades → All trades with PnL
+
+*Alpha & Moonshots:*
+• /alphapicks → View Alpha picks (≥29)
+• /moonshots → View 100x tokens
+• /realtrade → Toggle real/paper mode
 
 *Presets:*
 • /preset → Show current preset
@@ -2559,34 +2613,55 @@ Use /scan ${analysis.token.contractAddress} for full analysis
     return this.handlePaperTradesEnhanced(msg);
   }
 
-  // Access control check
+  // Access control check - STRICT: blocks all non-subscribers
   private async checkAccess(msg: TelegramBot.Message): Promise<boolean> {
     const userId = msg.from?.id || 0;
     const username = msg.from?.username;
 
-    // Check if admin (free access)
+    logger.info(`Access check for user ${userId} (${username || 'no username'})`);
+
+    // Check if admin (free access) - ONLY the exact admin username
     if (username && username.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
-      // Update username in DB
+      logger.info(`Admin access granted for ${username}`);
       db.updateTelegramUsername(userId, username);
       return true;
     }
 
-    // Check subscription
-    if (subscriptionManager.hasAccess(userId, username)) {
+    // Check subscription - must have is_subscribed = 1 AND valid expiry
+    const hasAccess = subscriptionManager.hasAccess(userId, username);
+
+    if (hasAccess) {
+      logger.info(`Subscription access granted for user ${userId}`);
       return true;
     }
 
-    // No access - show subscription message
+    // NO ACCESS - block and show subscription message
+    logger.info(`ACCESS DENIED for user ${userId} - no subscription`);
+
     await this.bot.sendMessage(msg.chat.id, `
-🔒 *Access Required*
+🔒 *Subscription Required*
 
-Welcome to Alpha Hunter! To use this bot, you need a subscription.
+You need an active subscription to use this feature.
 
-💰 *Subscription Price:* ${subscriptionManager.getPrice()} SOL
+💰 *Price:* ${subscriptionManager.getPrice()} SOL
 ⏰ *Duration:* 30 days
 
-Use /subscribe to get started!
-    `, { parse_mode: 'Markdown' });
+✨ *What you get:*
+• 🔍 Auto token scanning
+• 📝 Paper & real trading
+• ⭐ Alpha picks (score ≥29)
+• 🚀 100x moonshot tracking
+• 🤖 AI buy signals
+
+👉 Use /subscribe to get started!
+    `, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '💳 Subscribe Now', callback_data: 'subscribe_now' }]
+        ]
+      }
+    });
 
     return false;
   }
