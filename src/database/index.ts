@@ -380,25 +380,44 @@ class DatabaseManager {
   }
 
   // Check if user has access (is admin or has valid subscription)
+  // STRICT: Returns false by default, only true if explicitly subscribed
   hasAccess(userId: number, telegramUsername?: string): boolean {
-    // Check if it's the free admin
+    // Check if it's the free admin - exact match only
     if (telegramUsername && telegramUsername.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
+      logger.info(`Admin access for ${telegramUsername}`);
       return true;
     }
 
     const settings = this.getUserSettings(userId);
-    if (!settings) return false;
 
-    // Check username in settings
+    // No settings = no access
+    if (!settings) {
+      logger.info(`No settings found for user ${userId} - access denied`);
+      return false;
+    }
+
+    // Check username in settings matches admin
     if (settings.telegramUsername && settings.telegramUsername.toLowerCase() === FREE_ADMIN_USERNAME.toLowerCase()) {
+      logger.info(`Admin access via stored username for user ${userId}`);
       return true;
     }
 
-    // Check subscription
-    if (settings.isSubscribed && settings.subscriptionExpiresAt) {
-      return new Date() < settings.subscriptionExpiresAt;
+    // Check subscription - MUST have both is_subscribed = true AND valid expiry date
+    if (settings.isSubscribed === true && settings.subscriptionExpiresAt) {
+      const now = new Date();
+      const expiryDate = new Date(settings.subscriptionExpiresAt);
+
+      if (now < expiryDate) {
+        logger.info(`Subscription valid for user ${userId} until ${expiryDate.toISOString()}`);
+        return true;
+      } else {
+        logger.info(`Subscription EXPIRED for user ${userId} at ${expiryDate.toISOString()}`);
+        return false;
+      }
     }
 
+    // Default: NO ACCESS
+    logger.info(`No valid subscription for user ${userId} - access denied`);
     return false;
   }
 
