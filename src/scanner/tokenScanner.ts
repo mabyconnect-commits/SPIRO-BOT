@@ -689,11 +689,33 @@ export class TokenScanner {
     if (interval) {
       clearInterval(interval);
       this.userScanIntervals.delete(userId);
+
+      // Clean up memory - delete scanned tokens set to prevent memory leak
+      this.userScannedTokens.delete(userId);
+
       db.stopUserScanSession(userId);
-      logger.info(`🛑 Stopped scanning for user ${userId}`);
+      logger.info(`🛑 Stopped scanning for user ${userId} (memory cleaned)`);
       return true;
     }
     return false;
+  }
+
+  /**
+   * Clean up old scanned tokens to prevent memory bloat (call periodically)
+   * Limits each user's scanned tokens set to last 500 tokens
+   */
+  cleanupScannedTokens(): void {
+    const maxTokensPerUser = 500;
+
+    for (const [userId, tokens] of this.userScannedTokens.entries()) {
+      if (tokens.size > maxTokensPerUser) {
+        // Convert to array, keep only most recent (last added)
+        const tokenArray = Array.from(tokens);
+        const newSet = new Set(tokenArray.slice(-maxTokensPerUser));
+        this.userScannedTokens.set(userId, newSet);
+        logger.debug(`Cleaned up scanned tokens for user ${userId}: ${tokens.size} -> ${newSet.size}`);
+      }
+    }
   }
 
   /**

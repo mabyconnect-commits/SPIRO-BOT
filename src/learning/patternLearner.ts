@@ -132,8 +132,26 @@ export class PatternLearner {
   }
 
   private boostPatternPriority(patternId: string): void {
-    // This would adjust pattern weights or thresholds
-    logger.info(`Boosting priority for pattern ${patternId} to prevent drift`);
+    // Boost pattern priority by 1.5x for 24 hours
+    const boostMultiplier = 1.5;
+    const durationHours = 24;
+
+    db.setPatternBoost(patternId, boostMultiplier, 'Anti-drift: underused winning pattern', durationHours);
+    logger.info(`🔥 Boosted pattern ${patternId} priority by ${boostMultiplier}x for ${durationHours}h to prevent drift`);
+  }
+
+  /**
+   * Get boost multiplier for a pattern (used in scoring)
+   */
+  getPatternBoostMultiplier(patternId: string): number {
+    return db.getPatternBoost(patternId);
+  }
+
+  /**
+   * Get all active pattern boosts
+   */
+  getActiveBoosts(): { patternId: string; boost: number; reason: string }[] {
+    return db.getAllPatternBoosts();
   }
 
   /**
@@ -272,12 +290,31 @@ export class PatternLearner {
    * Update strategy thresholds based on learned data
    */
   private updateStrategyThresholds(avgWinningScore: number, avgWinningConfidence: number): void {
-    logger.info(`🎯 Updating strategy thresholds:`);
-    logger.info(`   Target score threshold: ${avgWinningScore.toFixed(0)} (from 2x+ winners)`);
-    logger.info(`   Target confidence threshold: ${(avgWinningConfidence * 100).toFixed(0)}%`);
+    // Validate inputs
+    if (!isFinite(avgWinningScore) || !isFinite(avgWinningConfidence)) {
+      logger.warn('Invalid threshold values, skipping update');
+      return;
+    }
 
-    // In a full implementation, this would update config or pattern weights
-    // For now, we log the insights for manual strategy adjustment
+    // Store learned thresholds in database
+    db.setStrategySetting('learned_min_score', avgWinningScore);
+    db.setStrategySetting('learned_min_confidence', avgWinningConfidence);
+    db.setStrategySetting('thresholds_updated_at', Date.now());
+
+    logger.info(`🎯 Strategy thresholds updated and saved:`);
+    logger.info(`   📊 Target score threshold: ${avgWinningScore.toFixed(0)} (from 2x+ winners)`);
+    logger.info(`   🎯 Target confidence threshold: ${(avgWinningConfidence * 100).toFixed(0)}%`);
+  }
+
+  /**
+   * Get learned strategy settings
+   */
+  getLearnedSettings(): { minScore: number; minConfidence: number; lastUpdated: number } {
+    return {
+      minScore: db.getStrategySetting('learned_min_score', 25), // Default 25
+      minConfidence: db.getStrategySetting('learned_min_confidence', 0.5), // Default 50%
+      lastUpdated: db.getStrategySetting('thresholds_updated_at', 0),
+    };
   }
 }
 

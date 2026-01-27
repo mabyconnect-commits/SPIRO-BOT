@@ -5,7 +5,13 @@ import db from '../database';
 import logger from '../utils/logger';
 
 const ENCRYPTION_ALGORITHM = 'aes-256-cbc';
-const ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || 'default-key-change-in-production-32b'; // Must be 32 bytes
+const DEFAULT_KEY = 'default-key-change-in-production-32b';
+const ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || DEFAULT_KEY;
+
+// Security warning for default encryption key
+if (ENCRYPTION_KEY === DEFAULT_KEY) {
+  logger.warn('⚠️ SECURITY WARNING: Using default encryption key! Set WALLET_ENCRYPTION_KEY in environment for production.');
+}
 
 class WalletManager {
   private connection: Connection;

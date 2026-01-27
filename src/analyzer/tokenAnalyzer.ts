@@ -109,26 +109,33 @@ export class TokenAnalyzer {
   }
 
   private analyzeTechnical(tokenData: TokenData, dexData: any): TechnicalSignal {
-    const volumeChange = dexData.volume?.h24 / (dexData.volume?.h6 || 1);
+    const volume24h = parseFloat(dexData.volume?.h24 || '0');
+    const volume6h = parseFloat(dexData.volume?.h6 || '1');
+    const volumeChange = volume6h > 0 ? volume24h / volume6h : 0;
     const volumeBreakout = volumeChange > 2.0; // 100%+ volume increase
 
-    const liquidityScore = Math.min(tokenData.liquidity / 100000, 1.0); // Normalized to $100k
+    const liquidityScore = tokenData.liquidity > 0
+      ? Math.min(tokenData.liquidity / 100000, 1.0) // Normalized to $100k
+      : 0;
+
+    // Safely get price change with fallback
+    const priceChange = tokenData.priceChange24h ?? 0;
 
     let priceAction: 'bullish' | 'bearish' | 'neutral' = 'neutral';
-    if (tokenData.priceChange24h > 20) priceAction = 'bullish';
-    else if (tokenData.priceChange24h < -20) priceAction = 'bearish';
+    if (priceChange > 20) priceAction = 'bullish';
+    else if (priceChange < -20) priceAction = 'bearish';
 
-    // Simple RSI estimation from price change
-    const rsi = 50 + (tokenData.priceChange24h / 2);
+    // Simple RSI estimation from price change (bounded)
+    const rsi = Math.max(0, Math.min(100, 50 + (priceChange / 2)));
 
-    const volatility = Math.abs(tokenData.priceChange24h) / 100;
+    const volatility = Math.abs(priceChange) / 100;
 
     return {
       volumeBreakout,
-      liquidityScore,
+      liquidityScore: isFinite(liquidityScore) ? liquidityScore : 0,
       priceAction,
-      rsi: Math.max(0, Math.min(100, rsi)),
-      volatility,
+      rsi: isFinite(rsi) ? rsi : 50,
+      volatility: isFinite(volatility) ? volatility : 0,
     };
   }
 
@@ -146,7 +153,13 @@ export class TokenAnalyzer {
     }
 
     const holderConcentration = topHolderPercentage / 100;
-    const tokenAge = (Date.now() - tokenData.createdAt.getTime()) / (1000 * 60 * 60); // hours
+
+    // Calculate token age with null safety
+    let tokenAge = 0;
+    if (tokenData.createdAt && tokenData.createdAt instanceof Date) {
+      tokenAge = (Date.now() - tokenData.createdAt.getTime()) / (1000 * 60 * 60); // hours
+      if (!isFinite(tokenAge) || tokenAge < 0) tokenAge = 0;
+    }
 
     // Check if liquidity is locked (from Birdeye or DexScreener)
     const liquidityLocked = securityData.isLpBurned ||

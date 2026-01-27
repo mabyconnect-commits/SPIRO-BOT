@@ -5,7 +5,13 @@ import db from '../database';
 import logger from '../utils/logger';
 
 const ENCRYPTION_ALGORITHM = 'aes-256-cbc';
-const ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || 'default-key-change-in-production-32b';
+const DEFAULT_KEY = 'default-key-change-in-production-32b';
+const ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || DEFAULT_KEY;
+
+// Security warning for default encryption key
+if (ENCRYPTION_KEY === DEFAULT_KEY) {
+  logger.warn('⚠️ SECURITY WARNING: Using default encryption key for subscriptions! Set WALLET_ENCRYPTION_KEY in environment.');
+}
 
 class SubscriptionManager {
   private connection: Connection;

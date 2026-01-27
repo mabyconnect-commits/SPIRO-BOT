@@ -142,12 +142,12 @@ export class AlphaHunterBot {
 
           // Check if user is setting up a PIN (allow this without subscription)
           if (this.pendingPinSetup.has(userId)) {
-            // Validate PIN (4 digits)
-            if (/^\d{4}$/.test(text)) {
+            // Validate PIN (6 digits for better security)
+            if (/^\d{6}$/.test(text)) {
               await this.handlePinSetup(msg.chat.id, userId, text);
               return;
             } else {
-              await this.bot.sendMessage(msg.chat.id, '❌ Invalid PIN. Please enter exactly 4 digits.');
+              await this.bot.sendMessage(msg.chat.id, '❌ Invalid PIN. Please enter exactly 6 digits for security.');
               return;
             }
           }

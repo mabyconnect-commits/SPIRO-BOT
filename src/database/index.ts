@@ -5,8 +5,8 @@ import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger';
 
-// Admin telegram username with free access
-const FREE_ADMIN_USERNAME = 'mabyconnect2000';
+// Admin telegram username with free access - sourced from config for single source of truth
+const FREE_ADMIN_USERNAME = config.subscription?.freeAdminUsername || 'mabyconnect2000';
 // Subscription price in SOL
 const SUBSCRIPTION_PRICE_SOL = 0.5;
 // Subscription duration in days
@@ -124,6 +124,26 @@ class DatabaseManager {
         return_percentage REAL,
         entry_signals TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Pattern boosts table - stores temporary priority boosts for patterns
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS pattern_boosts (
+        pattern_id TEXT PRIMARY KEY,
+        boost_multiplier REAL DEFAULT 1.0,
+        boost_reason TEXT,
+        boosted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME
+      )
+    `);
+
+    // Strategy settings table - learned thresholds
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS strategy_settings (
+        key TEXT PRIMARY KEY,
+        value REAL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -1138,6 +1158,70 @@ class DatabaseManager {
     `);
     const rows = stmt.all() as any[];
     return rows.map(r => r.user_id);
+  }
+
+  // Pattern boost methods
+  setPatternBoost(patternId: string, boostMultiplier: number, reason: string, durationHours: number = 24): void {
+    const expiresAt = new Date(Date.now() + durationHours * 60 * 60 * 1000).toISOString();
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO pattern_boosts (pattern_id, boost_multiplier, boost_reason, boosted_at, expires_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+    `);
+    stmt.run(patternId, boostMultiplier, reason, expiresAt);
+  }
+
+  getPatternBoost(patternId: string): number {
+    const stmt = this.db.prepare(`
+      SELECT boost_multiplier FROM pattern_boosts
+      WHERE pattern_id = ? AND expires_at > CURRENT_TIMESTAMP
+    `);
+    const row = stmt.get(patternId) as any;
+    return row?.boost_multiplier || 1.0;
+  }
+
+  getAllPatternBoosts(): { patternId: string; boost: number; reason: string }[] {
+    const stmt = this.db.prepare(`
+      SELECT pattern_id, boost_multiplier, boost_reason
+      FROM pattern_boosts WHERE expires_at > CURRENT_TIMESTAMP
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map(r => ({
+      patternId: r.pattern_id,
+      boost: r.boost_multiplier,
+      reason: r.boost_reason,
+    }));
+  }
+
+  clearExpiredBoosts(): void {
+    const stmt = this.db.prepare(`
+      DELETE FROM pattern_boosts WHERE expires_at <= CURRENT_TIMESTAMP
+    `);
+    stmt.run();
+  }
+
+  // Strategy settings methods
+  setStrategySetting(key: string, value: number): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO strategy_settings (key, value, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+    `);
+    stmt.run(key, value);
+  }
+
+  getStrategySetting(key: string, defaultValue: number = 0): number {
+    const stmt = this.db.prepare(`SELECT value FROM strategy_settings WHERE key = ?`);
+    const row = stmt.get(key) as any;
+    return row?.value ?? defaultValue;
+  }
+
+  getAllStrategySettings(): { [key: string]: number } {
+    const stmt = this.db.prepare(`SELECT key, value FROM strategy_settings`);
+    const rows = stmt.all() as any[];
+    const settings: { [key: string]: number } = {};
+    rows.forEach(r => {
+      settings[r.key] = r.value;
+    });
+    return settings;
   }
 
   close(): void {

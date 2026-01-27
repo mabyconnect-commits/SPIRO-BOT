@@ -87,7 +87,20 @@ export class TradingEngine {
     }
 
     const tokenPrice = analysis.token.price;
+
+    // Validate token price before calculating amount
+    if (!tokenPrice || tokenPrice <= 0 || !isFinite(tokenPrice)) {
+      logger.error(`❌ Invalid token price: ${tokenPrice} for ${analysis.token.symbol}`);
+      return null;
+    }
+
     const tokenAmount = (solAmount / tokenPrice) * 0.99; // Account for slippage
+
+    // Validate calculated amount
+    if (!isFinite(tokenAmount) || tokenAmount <= 0) {
+      logger.error(`❌ Invalid token amount calculated: ${tokenAmount}`);
+      return null;
+    }
 
     // Deduct from paper balance
     const newBalance = currentBalance - solAmount;
@@ -206,7 +219,21 @@ export class TradingEngine {
       }
 
       const tokenPrice = analysis.token.price;
-      const tokenAmount = parseFloat(quote.outAmount) / Math.pow(10, 9); // Adjust for decimals
+
+      // Validate quote response
+      if (!quote.outAmount) {
+        logger.error('❌ Invalid quote response - missing outAmount');
+        return null;
+      }
+
+      // Parse token amount with validation (default to 9 decimals for SPL tokens)
+      const decimals = quote.outputDecimals || 9;
+      const tokenAmount = parseFloat(quote.outAmount) / Math.pow(10, decimals);
+
+      if (!isFinite(tokenAmount) || tokenAmount <= 0) {
+        logger.error(`❌ Invalid token amount from quote: ${tokenAmount}`);
+        return null;
+      }
 
       const position: TradePosition = {
         id: signature,
