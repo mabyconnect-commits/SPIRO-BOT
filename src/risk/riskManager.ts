@@ -63,6 +63,7 @@ export class RiskManager {
   private blacklist: Map<string, BlacklistEntry> = new Map();
   private dailyPnL: Map<number, { pnl: number; date: string }> = new Map();
   private userExposure: Map<number, number> = new Map();
+  private lockedUsers: Map<number, { lockedAt: string; reason: string }> = new Map();
 
   // Risk parameters
   private globalKillSwitch: boolean = false;
@@ -306,6 +307,15 @@ export class RiskManager {
       preset.riskLevel === 'aggressive' || preset.riskLevel === 'degen' ? 'high' :
       'medium';
 
+    // Check if user is locked (daily reset at midnight)
+    const lockInfo = this.lockedUsers.get(userId);
+    const isLocked = lockInfo ? lockInfo.lockedAt === today : false;
+
+    // Clear stale locks from previous days
+    if (lockInfo && lockInfo.lockedAt !== today) {
+      this.lockedUsers.delete(userId);
+    }
+
     return {
       userId,
       maxExposureSol: preset.maxPositionSizeSol * preset.maxOpenPositions,
@@ -315,7 +325,7 @@ export class RiskManager {
       openPositionCount: openPositions.length,
       maxPositions: preset.maxOpenPositions,
       riskTolerance,
-      isLocked: false,
+      isLocked,
     };
   }
 
@@ -329,8 +339,38 @@ export class RiskManager {
     }
   }
 
-  private lockUserTrading(userId: number): void {
-    logger.warn(`🔒 Trading LOCKED for user ${userId} - daily loss limit hit`);
+  private lockUserTrading(userId: number, reason: string = 'Daily loss limit hit'): void {
+    const today = new Date().toISOString().split('T')[0];
+    this.lockedUsers.set(userId, { lockedAt: today, reason });
+    logger.warn(`🔒 Trading LOCKED for user ${userId} - ${reason}`);
+  }
+
+  /**
+   * Manually unlock a user's trading (admin function)
+   */
+  unlockUserTrading(userId: number): boolean {
+    const wasLocked = this.lockedUsers.has(userId);
+    this.lockedUsers.delete(userId);
+    if (wasLocked) {
+      logger.info(`🔓 Trading UNLOCKED for user ${userId}`);
+    }
+    return wasLocked;
+  }
+
+  /**
+   * Check if user is currently locked
+   */
+  isUserLocked(userId: number): boolean {
+    const lockInfo = this.lockedUsers.get(userId);
+    if (!lockInfo) return false;
+
+    const today = new Date().toISOString().split('T')[0];
+    if (lockInfo.lockedAt !== today) {
+      // Auto-unlock if lock was from a previous day
+      this.lockedUsers.delete(userId);
+      return false;
+    }
+    return true;
   }
 
   // ============================================================

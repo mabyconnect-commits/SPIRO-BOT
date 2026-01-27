@@ -359,20 +359,37 @@ export class TokenScanner {
   }
 
   /**
-   * Handle auto-trading for users with it enabled
+   * Handle auto-trading for all users with it enabled
    */
   private async handleAutoTrade(analysis: AnalysisResult): Promise<void> {
-    // In a multi-user system, you would iterate through users with auto_trade enabled
-    // For now, checking if auto-trade is enabled via config
+    // Get all users with auto-trade enabled and active subscriptions
+    const autoTradeUsers = db.getAutoTradeSubscribers();
 
-    // Get user with ID 0 (default/admin)
-    const userSettings = db.getUserSettings(0);
+    if (autoTradeUsers.length === 0) {
+      logger.debug('No users with auto-trade enabled');
+      return;
+    }
 
-    if (userSettings && userSettings.autoTrade && !userSettings.paperTrading) {
-      logger.info(`Auto-trading for user 0: ${analysis.token.symbol}`);
+    logger.info(`Processing auto-trade for ${autoTradeUsers.length} users: ${analysis.token.symbol}`);
 
-      const preset = userSettings.preset;
-      await tradingEngine.buy(analysis, 1.0, 0, false);
+    for (const user of autoTradeUsers) {
+      try {
+        // Get full user settings for trade sizing
+        const userSettings = db.getUserSettings(user.userId);
+        if (!userSettings) continue;
+
+        // Use paper trading setting from user
+        const isPaperTrade = user.paperTrading;
+        const tradeSize = analysis.confidence >= config.paperTrading.highConfidenceThreshold
+          ? userSettings.highConfidenceTradeSize
+          : userSettings.defaultTradeSize;
+
+        logger.info(`Auto-trading for user ${user.userId} (${isPaperTrade ? 'PAPER' : 'REAL'}): ${analysis.token.symbol} @ ${tradeSize} SOL`);
+
+        await tradingEngine.buy(analysis, tradeSize, user.userId, isPaperTrade);
+      } catch (error) {
+        logger.error(`Auto-trade error for user ${user.userId}:`, error);
+      }
     }
   }
 

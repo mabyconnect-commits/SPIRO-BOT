@@ -352,9 +352,16 @@ export class TokenAnalyzer {
     if (priceChange > 20 && buyRatio > 1.2) sentiment = 'positive';
     else if (priceChange < -20 && buyRatio < 0.8) sentiment = 'negative';
 
+    // Note: Real Twitter mentions would require Twitter API integration
+    // Estimate social activity based on volume growth and presence of socials
+    // High volume growth with social links suggests active community engagement
+    const estimatedSocialActivity = hasTwitter
+      ? Math.min(Math.round(volumeGrowth * 10 + socialPresence * 5), 100)
+      : 0;
+
     return {
-      twitterMentions: hasTwitter ? 10 : 0, // Placeholder - would need Twitter API
-      influencerEngagement: socialPresence > 2 ? 5 : socialPresence,
+      twitterMentions: estimatedSocialActivity,
+      influencerEngagement: socialPresence + (volumeGrowth > 2 ? 2 : 0),
       sentiment,
       trendingScore,
     };
