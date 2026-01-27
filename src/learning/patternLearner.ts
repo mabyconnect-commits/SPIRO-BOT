@@ -128,9 +128,7 @@ export class PatternLearner {
   }
 
   private getRecentTradesForPattern(patternId: string, limit: number): LearningData[] {
-    // This would query the database for recent trades matching this pattern
-    // For now, simplified implementation
-    return [];
+    return db.getRecentTradesForPattern(patternId, limit);
   }
 
   private boostPatternPriority(patternId: string): void {

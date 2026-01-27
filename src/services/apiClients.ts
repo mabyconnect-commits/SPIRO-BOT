@@ -138,8 +138,11 @@ export class HeliusClient {
     }
   }
 
-  async getTokenHolders(mintAddress: string): Promise<number> {
-    if (!this.apiKey) return 0;
+  async getTokenHolders(mintAddress: string): Promise<number | null> {
+    if (!this.apiKey) {
+      logger.debug('Helius API key not configured, skipping holders check');
+      return null;
+    }
 
     try {
       const response = await axios.get(
@@ -150,8 +153,8 @@ export class HeliusClient {
       );
       return response.data.total || 0;
     } catch (error) {
-      logger.error(`Helius holders error:`, error);
-      return 0;
+      logger.error(`Helius holders error for ${mintAddress}:`, error);
+      return null; // Return null on error to distinguish from valid 0
     }
   }
 }
@@ -195,15 +198,16 @@ export class JupiterClient {
     }
   }
 
-  async getTokenPrice(mintAddress: string): Promise<number> {
+  async getTokenPrice(mintAddress: string): Promise<number | null> {
     try {
       const response = await axios.get(
         `https://price.jup.ag/v4/price?ids=${mintAddress}`
       );
-      return response.data.data?.[mintAddress]?.price || 0;
+      const price = response.data.data?.[mintAddress]?.price;
+      return price !== undefined ? price : null;
     } catch (error) {
-      logger.error(`Jupiter price error:`, error);
-      return 0;
+      logger.error(`Jupiter price error for ${mintAddress}:`, error);
+      return null; // Return null on error to distinguish from valid 0
     }
   }
 }

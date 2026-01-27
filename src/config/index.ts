@@ -47,6 +47,9 @@ export const config = {
   database: {
     path: process.env.DB_PATH || './data/alpha-hunter.db',
   },
+  security: {
+    encryptionKey: process.env.WALLET_ENCRYPTION_KEY || 'default-key-change-in-production-32b',
+  },
   logging: {
     level: process.env.LOG_LEVEL || 'info',
     file: process.env.LOG_FILE || './logs/alpha-hunter.log',

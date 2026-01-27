@@ -27,6 +27,25 @@ class DatabaseManager {
     this.initialize();
   }
 
+  /**
+   * Safely add a column to a table - ignores "column already exists" errors,
+   * but logs other database errors
+   */
+  private safeAddColumn(table: string, column: string, type: string): void {
+    try {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      logger.debug(`Added column ${column} to ${table}`);
+    } catch (error: any) {
+      // SQLite error when column exists is "duplicate column name"
+      if (error.message?.includes('duplicate column')) {
+        // Expected - column already exists
+        return;
+      }
+      // Log unexpected errors
+      logger.error(`Error adding column ${column} to ${table}:`, error);
+    }
+  }
+
   private initialize() {
     // Users table with extended fields
     this.db.exec(`
@@ -50,30 +69,14 @@ class DatabaseManager {
     `);
 
     // Add columns if they don't exist (for existing databases)
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN telegram_username TEXT`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN paper_balance REAL DEFAULT 100.0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN default_trade_size REAL DEFAULT 0.35`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN high_confidence_trade_size REAL DEFAULT 0.5`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN take_profit_percentage REAL DEFAULT 30.0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN stop_loss_percentage REAL DEFAULT 15.0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN is_subscribed INTEGER DEFAULT 0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN subscription_expires_at DATETIME`);
-    } catch (e) { /* Column exists */ }
+    this.safeAddColumn('users', 'telegram_username', 'TEXT');
+    this.safeAddColumn('users', 'paper_balance', 'REAL DEFAULT 100.0');
+    this.safeAddColumn('users', 'default_trade_size', 'REAL DEFAULT 0.35');
+    this.safeAddColumn('users', 'high_confidence_trade_size', 'REAL DEFAULT 0.5');
+    this.safeAddColumn('users', 'take_profit_percentage', 'REAL DEFAULT 30.0');
+    this.safeAddColumn('users', 'stop_loss_percentage', 'REAL DEFAULT 15.0');
+    this.safeAddColumn('users', 'is_subscribed', 'INTEGER DEFAULT 0');
+    this.safeAddColumn('users', 'subscription_expires_at', 'DATETIME');
 
     // Subscription payments table
     this.db.exec(`
@@ -323,18 +326,10 @@ class DatabaseManager {
     `);
 
     // Add columns to users table for per-user paper trading
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN total_paper_trades INTEGER DEFAULT 0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN paper_pnl_total REAL DEFAULT 0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN paper_winners INTEGER DEFAULT 0`);
-    } catch (e) { /* Column exists */ }
-    try {
-      this.db.exec(`ALTER TABLE users ADD COLUMN paper_losers INTEGER DEFAULT 0`);
-    } catch (e) { /* Column exists */ }
+    this.safeAddColumn('users', 'total_paper_trades', 'INTEGER DEFAULT 0');
+    this.safeAddColumn('users', 'paper_pnl_total', 'REAL DEFAULT 0');
+    this.safeAddColumn('users', 'paper_winners', 'INTEGER DEFAULT 0');
+    this.safeAddColumn('users', 'paper_losers', 'INTEGER DEFAULT 0');
 
     logger.info('Database initialized successfully');
   }
@@ -715,7 +710,7 @@ class DatabaseManager {
 
     stmt.run(
       position.id,
-      0, // Default user, will be updated for multi-user
+      position.userId || 0,
       position.contractAddress,
       position.symbol,
       position.entryPrice,
@@ -739,6 +734,7 @@ class DatabaseManager {
 
     return rows.map(row => ({
       id: row.id,
+      userId: row.user_id,
       contractAddress: row.contract_address,
       symbol: row.symbol,
       entryPrice: row.entry_price,
@@ -786,6 +782,27 @@ class DatabaseManager {
       avgReturn: result.avg_return || 0,
       sampleSize: result.total || 0,
     };
+  }
+
+  getRecentTradesForPattern(patternId: string, limit: number): any[] {
+    const stmt = this.db.prepare(`
+      SELECT pattern_id, trade_id, outcome, return_percentage, entry_signals, timestamp
+      FROM learning_data
+      WHERE pattern_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `);
+
+    const rows = stmt.all(patternId, limit) as any[];
+
+    return rows.map(row => ({
+      patternId: row.pattern_id,
+      tradeId: row.trade_id,
+      outcome: row.outcome,
+      returnPercentage: row.return_percentage,
+      entrySignals: row.entry_signals ? JSON.parse(row.entry_signals) : {},
+      timestamp: new Date(row.timestamp),
+    }));
   }
 
   createWallet(userId: number, publicKey: string, encryptedPrivateKey: string): void {
