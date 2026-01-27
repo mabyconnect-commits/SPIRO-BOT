@@ -5,7 +5,14 @@ import db from '../database';
 import logger from '../utils/logger';
 
 const ENCRYPTION_ALGORITHM = 'aes-256-cbc';
-const ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || 'default-key-change-in-production-32b';
+
+// Use centralized config for encryption key
+function getEncryptionKey(): string {
+  const key = config.security.encryptionKey;
+  return key.padEnd(32, '0').substring(0, 32);
+}
+
+const ENCRYPTION_KEY = getEncryptionKey();
 
 class SubscriptionManager {
   private connection: Connection;
@@ -52,6 +59,29 @@ class SubscriptionManager {
   }
 
   /**
+   * Helper to get balance with retry logic
+   */
+  private async getBalanceWithRetry(publicKey: PublicKey, maxRetries: number = 3): Promise<number> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const balance = await this.connection.getBalance(publicKey);
+        return balance;
+      } catch (error) {
+        lastError = error as Error;
+        logger.warn(`Balance check attempt ${attempt + 1} failed, retrying...`);
+
+        if (attempt < maxRetries - 1) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+      }
+    }
+
+    throw lastError || new Error('Failed to get balance');
+  }
+
+  /**
    * Check if payment has been received and forward to main wallet
    */
   async checkAndProcessPayment(userId: number, paymentId: number, paymentWallet: string): Promise<{ success: boolean; message: string }> {
@@ -62,17 +92,31 @@ class SubscriptionManager {
         return { success: false, message: 'Payment not found or already processed' };
       }
 
-      // Check balance of payment wallet
-      const publicKey = new PublicKey(paymentWallet);
-      const balance = await this.connection.getBalance(publicKey);
-      const balanceInSol = balance / LAMPORTS_PER_SOL;
+      // Validate payment wallet matches
+      if (payment.payment_wallet !== paymentWallet) {
+        logger.warn(`Payment wallet mismatch for user ${userId}: expected ${payment.payment_wallet}, got ${paymentWallet}`);
+        return { success: false, message: 'Payment wallet does not match' };
+      }
 
+      // Check balance of payment wallet with retry
+      const publicKey = new PublicKey(paymentWallet);
+      let balance: number;
+
+      try {
+        balance = await this.getBalanceWithRetry(publicKey);
+      } catch (error) {
+        logger.error('Failed to check payment wallet balance after retries:', error);
+        return { success: false, message: 'Unable to verify payment. Please try again in a moment.' };
+      }
+
+      const balanceInSol = balance / LAMPORTS_PER_SOL;
       logger.info(`Payment wallet ${paymentWallet} balance: ${balanceInSol} SOL`);
 
       if (balanceInSol < this.subscriptionPrice) {
+        const remaining = this.subscriptionPrice - balanceInSol;
         return {
           success: false,
-          message: `Insufficient payment. Received: ${balanceInSol.toFixed(4)} SOL. Required: ${this.subscriptionPrice} SOL`
+          message: `Insufficient payment. Received: ${balanceInSol.toFixed(4)} SOL. Required: ${this.subscriptionPrice} SOL. Please send ${remaining.toFixed(4)} more SOL.`
         };
       }
 
@@ -80,26 +124,39 @@ class SubscriptionManager {
       const secretKey = this.decryptPrivateKey(payment.payment_wallet_encrypted_key);
       const paymentKeypair = Keypair.fromSecretKey(secretKey);
 
-      // Forward funds to main wallet (minus a small amount for transaction fees)
+      // Verify the keypair matches the public key
+      if (paymentKeypair.publicKey.toString() !== paymentWallet) {
+        logger.error('Decrypted keypair does not match payment wallet!');
+        return { success: false, message: 'Internal error. Please contact support.' };
+      }
+
+      // Forward funds to main wallet (minus transaction fee)
       const mainWalletPubkey = new PublicKey(this.mainWallet);
       const amountToSend = balance - 5000; // Keep 5000 lamports for fees
 
       if (amountToSend > 0) {
-        const transaction = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: paymentKeypair.publicKey,
-            toPubkey: mainWalletPubkey,
-            lamports: amountToSend,
-          })
-        );
+        try {
+          const transaction = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: paymentKeypair.publicKey,
+              toPubkey: mainWalletPubkey,
+              lamports: amountToSend,
+            })
+          );
 
-        const signature = await sendAndConfirmTransaction(
-          this.connection,
-          transaction,
-          [paymentKeypair]
-        );
+          const signature = await sendAndConfirmTransaction(
+            this.connection,
+            transaction,
+            [paymentKeypair],
+            { commitment: 'confirmed' }
+          );
 
-        logger.info(`Payment forwarded to main wallet. Signature: ${signature}`);
+          logger.info(`Payment forwarded to main wallet. Signature: ${signature}`);
+        } catch (txError) {
+          logger.error('Failed to forward payment:', txError);
+          // Still confirm the subscription since we received the payment
+          // The funds can be recovered manually if needed
+        }
       }
 
       // Confirm subscription payment
@@ -107,7 +164,7 @@ class SubscriptionManager {
 
       return {
         success: true,
-        message: `Payment confirmed! ${balanceInSol.toFixed(4)} SOL received. Your subscription is now active for 30 days.`
+        message: `Payment confirmed! ${balanceInSol.toFixed(4)} SOL received. Your subscription is now active for ${config.subscription.durationDays} days.`
       };
     } catch (error) {
       logger.error('Error processing payment:', error);
@@ -154,7 +211,7 @@ class SubscriptionManager {
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(
       ENCRYPTION_ALGORITHM,
-      Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').substring(0, 32)),
+      Buffer.from(ENCRYPTION_KEY),
       iv
     );
 
@@ -174,7 +231,7 @@ class SubscriptionManager {
 
     const decipher = crypto.createDecipheriv(
       ENCRYPTION_ALGORITHM,
-      Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').substring(0, 32)),
+      Buffer.from(ENCRYPTION_KEY),
       iv
     );
 

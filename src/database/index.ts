@@ -5,14 +5,11 @@ import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger';
 
-// Admin telegram username with free access
-const FREE_ADMIN_USERNAME = 'mabyconnect2000';
-// Subscription price in SOL
-const SUBSCRIPTION_PRICE_SOL = 0.5;
-// Subscription duration in days
-const SUBSCRIPTION_DURATION_DAYS = 30;
-// Main wallet to receive payments
-const MAIN_WALLET = 'EAi7pueCbhkioMb8kHtib2hrVWvTkhkPpNq4saHQfhFy';
+// Use config values instead of hardcoded credentials
+const FREE_ADMIN_USERNAME = config.subscription.freeAdminUsername;
+const SUBSCRIPTION_PRICE_SOL = config.subscription.priceSol;
+const SUBSCRIPTION_DURATION_DAYS = config.subscription.durationDays;
+const MAIN_WALLET = config.subscription.mainWallet;
 
 class DatabaseManager {
   private db: Database.Database;
@@ -1138,6 +1135,40 @@ class DatabaseManager {
     `);
     const rows = stmt.all() as any[];
     return rows.map(r => r.user_id);
+  }
+
+  /**
+   * Get all users with auto-trade enabled
+   * Returns array of user settings for users with auto_trade = 1
+   */
+  getUsersWithAutoTrade(): { userId: number; paperTrading: boolean; preset: string }[] {
+    const stmt = this.db.prepare(`
+      SELECT user_id, paper_trading, preset FROM users WHERE auto_trade = 1
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map(r => ({
+      userId: r.user_id,
+      paperTrading: r.paper_trading === 1,
+      preset: r.preset,
+    }));
+  }
+
+  /**
+   * Get all users with active subscriptions who have auto-trade enabled
+   */
+  getAutoTradeSubscribers(): { userId: number; paperTrading: boolean; preset: string }[] {
+    const stmt = this.db.prepare(`
+      SELECT user_id, paper_trading, preset FROM users
+      WHERE auto_trade = 1
+      AND is_subscribed = 1
+      AND subscription_expires_at > datetime('now')
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map(r => ({
+      userId: r.user_id,
+      paperTrading: r.paper_trading === 1,
+      preset: r.preset,
+    }));
   }
 
   close(): void {

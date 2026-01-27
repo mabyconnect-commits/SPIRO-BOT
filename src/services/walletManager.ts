@@ -5,13 +5,28 @@ import db from '../database';
 import logger from '../utils/logger';
 
 const ENCRYPTION_ALGORITHM = 'aes-256-cbc';
-const ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || 'default-key-change-in-production-32b'; // Must be 32 bytes
+
+// Use config for encryption key with security validation
+function getEncryptionKey(): string {
+  const key = config.security.encryptionKey;
+  const isDefaultKey = key === 'default-key-change-in-production-32b';
+
+  if (isDefaultKey) {
+    logger.warn('⚠️ SECURITY WARNING: Using default encryption key! Set WALLET_ENCRYPTION_KEY in .env for production!');
+  }
+
+  // Ensure key is exactly 32 bytes for AES-256
+  return key.padEnd(32, '0').substring(0, 32);
+}
+
+const ENCRYPTION_KEY = getEncryptionKey();
 
 class WalletManager {
   private connection: Connection;
 
   constructor() {
     this.connection = new Connection(config.solana.rpcUrl, 'confirmed');
+    logger.info('WalletManager initialized with Solana RPC:', config.solana.rpcUrl);
   }
 
   /**
@@ -85,7 +100,7 @@ class WalletManager {
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(
       ENCRYPTION_ALGORITHM,
-      Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').substring(0, 32)),
+      Buffer.from(ENCRYPTION_KEY),
       iv
     );
 
@@ -105,7 +120,7 @@ class WalletManager {
 
     const decipher = crypto.createDecipheriv(
       ENCRYPTION_ALGORITHM,
-      Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').substring(0, 32)),
+      Buffer.from(ENCRYPTION_KEY),
       iv
     );
 
