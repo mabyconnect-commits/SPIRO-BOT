@@ -1,44 +1,149 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import { config } from '../config';
 import logger from '../utils/logger';
 import { TokenData } from '../types';
+
+// API configuration
+const API_TIMEOUT = 15000; // 15 seconds
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [1000, 2000, 4000]; // Exponential backoff
+
+// Helper function for delay
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper function for retry with exponential backoff
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  operationName: string,
+  maxRetries: number = MAX_RETRIES
+): Promise<T | null> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      const isLastAttempt = attempt === maxRetries - 1;
+
+      // Check if it's a rate limit or server error (worth retrying)
+      const axiosError = error as AxiosError;
+      const statusCode = axiosError?.response?.status;
+      const isRetryable = !statusCode || statusCode >= 500 || statusCode === 429;
+
+      if (!isRetryable || isLastAttempt) {
+        break;
+      }
+
+      const delay = RETRY_DELAYS[attempt] || RETRY_DELAYS[RETRY_DELAYS.length - 1];
+      logger.warn(`${operationName} attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+      await sleep(delay);
+    }
+  }
+
+  logger.error(`${operationName} failed after ${maxRetries} attempts:`, lastError);
+  return null;
+}
+
+// Error type for more specific error handling
+export interface ApiError {
+  type: 'timeout' | 'rate_limit' | 'not_found' | 'server_error' | 'network' | 'unknown';
+  message: string;
+  statusCode?: number;
+}
+
+function classifyError(error: unknown): ApiError {
+  const axiosError = error as AxiosError;
+
+  if (axiosError?.code === 'ECONNABORTED' || axiosError?.code === 'ETIMEDOUT') {
+    return { type: 'timeout', message: 'Request timed out' };
+  }
+
+  if (axiosError?.code === 'ENOTFOUND' || axiosError?.code === 'ECONNREFUSED') {
+    return { type: 'network', message: 'Network error - unable to reach API' };
+  }
+
+  const statusCode = axiosError?.response?.status;
+  if (statusCode === 429) {
+    return { type: 'rate_limit', message: 'Rate limited - too many requests', statusCode };
+  }
+  if (statusCode === 404) {
+    return { type: 'not_found', message: 'Token not found', statusCode };
+  }
+  if (statusCode && statusCode >= 500) {
+    return { type: 'server_error', message: 'API server error', statusCode };
+  }
+
+  return { type: 'unknown', message: String(error), statusCode };
+}
 
 export class DexScreenerClient {
   private baseUrl = 'https://api.dexscreener.com/latest/dex';
 
   async getTokenData(contractAddress: string): Promise<any> {
+    return withRetry(async () => {
+      const response = await axios.get(
+        `${this.baseUrl}/tokens/${contractAddress}`,
+        { timeout: API_TIMEOUT }
+      );
+
+      const pair = response.data.pairs?.[0];
+      if (!pair) {
+        logger.debug(`No pairs found on DexScreener for ${contractAddress}`);
+        return null;
+      }
+
+      return pair;
+    }, `DexScreener.getTokenData(${contractAddress.substring(0, 8)}...)`);
+  }
+
+  // Get token data with detailed error info
+  async getTokenDataWithError(contractAddress: string): Promise<{ data: any; error?: ApiError }> {
     try {
       const response = await axios.get(
-        `${this.baseUrl}/tokens/${contractAddress}`
+        `${this.baseUrl}/tokens/${contractAddress}`,
+        { timeout: API_TIMEOUT }
       );
-      return response.data.pairs?.[0] || null;
+
+      const pair = response.data.pairs?.[0];
+      if (!pair) {
+        return {
+          data: null,
+          error: { type: 'not_found', message: 'Token not listed on DexScreener yet' }
+        };
+      }
+
+      return { data: pair };
     } catch (error) {
-      logger.error(`DexScreener API error for ${contractAddress}:`, error);
-      return null;
+      return { data: null, error: classifyError(error) };
     }
   }
 
   async searchPairs(query: string): Promise<any[]> {
-    try {
-      const response = await axios.get(`${this.baseUrl}/search?q=${query}`);
+    const result = await withRetry(async () => {
+      const response = await axios.get(
+        `${this.baseUrl}/search?q=${query}`,
+        { timeout: API_TIMEOUT }
+      );
       return response.data.pairs || [];
-    } catch (error) {
-      logger.error(`DexScreener search error:`, error);
-      return [];
-    }
+    }, `DexScreener.searchPairs(${query})`);
+
+    return result || [];
   }
 
   /**
    * Get new pairs from specific DEXs (launchpads)
    */
   async getNewPairs(): Promise<any[]> {
-    try {
-      const response = await axios.get(`${this.baseUrl}/pairs/solana`);
+    const result = await withRetry(async () => {
+      const response = await axios.get(
+        `${this.baseUrl}/pairs/solana`,
+        { timeout: API_TIMEOUT }
+      );
       return response.data.pairs || [];
-    } catch (error) {
-      logger.error(`DexScreener new pairs error:`, error);
-      return [];
-    }
+    }, 'DexScreener.getNewPairs');
+
+    return result || [];
   }
 
   /**
@@ -77,37 +182,33 @@ export class BirdeyeClient {
       return null;
     }
 
-    try {
+    return withRetry(async () => {
       const response = await axios.get(
         `${this.baseUrl}/defi/token_overview`,
         {
           params: { address: contractAddress },
           headers: { 'X-API-KEY': this.apiKey },
+          timeout: API_TIMEOUT,
         }
       );
       return response.data.data;
-    } catch (error) {
-      logger.error(`Birdeye API error:`, error);
-      return null;
-    }
+    }, `Birdeye.getTokenOverview(${contractAddress.substring(0, 8)}...)`);
   }
 
   async getTokenSecurity(contractAddress: string): Promise<any> {
     if (!this.apiKey) return null;
 
-    try {
+    return withRetry(async () => {
       const response = await axios.get(
         `${this.baseUrl}/defi/token_security`,
         {
           params: { address: contractAddress },
           headers: { 'X-API-KEY': this.apiKey },
+          timeout: API_TIMEOUT,
         }
       );
       return response.data.data;
-    } catch (error) {
-      logger.error(`Birdeye security check error:`, error);
-      return null;
-    }
+    }, `Birdeye.getTokenSecurity(${contractAddress.substring(0, 8)}...)`);
   }
 }
 
@@ -121,7 +222,7 @@ export class HeliusClient {
       return null;
     }
 
-    try {
+    return withRetry(async () => {
       const response = await axios.post(
         `${this.baseUrl}/token-metadata`,
         {
@@ -129,13 +230,11 @@ export class HeliusClient {
         },
         {
           params: { 'api-key': this.apiKey },
+          timeout: API_TIMEOUT,
         }
       );
       return response.data[0];
-    } catch (error) {
-      logger.error(`Helius API error:`, error);
-      return null;
-    }
+    }, `Helius.getAsset(${mintAddress.substring(0, 8)}...)`);
   }
 
   async getTokenHolders(mintAddress: string): Promise<number | null> {
@@ -144,18 +243,16 @@ export class HeliusClient {
       return null;
     }
 
-    try {
+    return withRetry(async () => {
       const response = await axios.get(
         `${this.baseUrl}/addresses/${mintAddress}/holders`,
         {
           params: { 'api-key': this.apiKey },
+          timeout: API_TIMEOUT,
         }
       );
       return response.data.total || 0;
-    } catch (error) {
-      logger.error(`Helius holders error for ${mintAddress}:`, error);
-      return null; // Return null on error to distinguish from valid 0
-    }
+    }, `Helius.getTokenHolders(${mintAddress.substring(0, 8)}...)`);
   }
 }
 
@@ -168,7 +265,7 @@ export class JupiterClient {
     amount: number,
     slippageBps: number = 100
   ): Promise<any> {
-    try {
+    return withRetry(async () => {
       const response = await axios.get(`${this.baseUrl}/quote`, {
         params: {
           inputMint,
@@ -176,39 +273,32 @@ export class JupiterClient {
           amount,
           slippageBps,
         },
+        timeout: API_TIMEOUT,
       });
       return response.data;
-    } catch (error) {
-      logger.error(`Jupiter quote error:`, error);
-      return null;
-    }
+    }, 'Jupiter.getQuote');
   }
 
   async getSwapTransaction(quoteResponse: any, userPublicKey: string): Promise<any> {
-    try {
+    return withRetry(async () => {
       const response = await axios.post(`${this.baseUrl}/swap`, {
         quoteResponse,
         userPublicKey,
         wrapUnwrapSOL: true,
-      });
+      }, { timeout: API_TIMEOUT });
       return response.data;
-    } catch (error) {
-      logger.error(`Jupiter swap error:`, error);
-      return null;
-    }
+    }, 'Jupiter.getSwapTransaction');
   }
 
   async getTokenPrice(mintAddress: string): Promise<number | null> {
-    try {
+    return withRetry(async () => {
       const response = await axios.get(
-        `https://price.jup.ag/v4/price?ids=${mintAddress}`
+        `https://price.jup.ag/v4/price?ids=${mintAddress}`,
+        { timeout: API_TIMEOUT }
       );
       const price = response.data.data?.[mintAddress]?.price;
       return price !== undefined ? price : null;
-    } catch (error) {
-      logger.error(`Jupiter price error for ${mintAddress}:`, error);
-      return null; // Return null on error to distinguish from valid 0
-    }
+    }, `Jupiter.getTokenPrice(${mintAddress.substring(0, 8)}...)`);
   }
 }
 

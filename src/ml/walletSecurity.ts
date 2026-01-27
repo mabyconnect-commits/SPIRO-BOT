@@ -373,7 +373,7 @@ export class SecureWalletManager {
     if (!storedHash) return true; // No PIN set = always passes
 
     const inputHash = crypto.createHash('sha256').update(pin + userId.toString()).digest('hex');
-    return crypto.timingsSafeEqual(Buffer.from(storedHash), Buffer.from(inputHash));
+    return crypto.timingSafeEqual(Buffer.from(storedHash), Buffer.from(inputHash));
   }
 
   /**
