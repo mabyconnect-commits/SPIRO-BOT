@@ -278,7 +278,7 @@ export class TokenAnalyzer {
 
   private analyzeFundamental(tokenData: TokenData, dexData: any, birdeyeData: any): FundamentalSignal {
     // Extract security data from Birdeye if available
-    const securityData = birdeyeData?.security || {};
+    const securityData = birdeyeData?.security || birdeyeData || {};
 
     // Top holder percentage from Birdeye or estimate from holder count
     let topHolderPercentage = securityData.top10HolderPercent || 0;
@@ -292,17 +292,11 @@ export class TokenAnalyzer {
     const holderConcentration = topHolderPercentage / 100;
     const tokenAge = (Date.now() - tokenData.createdAt.getTime()) / (1000 * 60 * 60); // hours
 
-    // Check if liquidity is locked (from Birdeye or DexScreener)
-    const liquidityLocked = securityData.isLpBurned ||
-                           securityData.lpLocked ||
-                           dexData.info?.socials?.some((s: any) =>
-                             s.type === 'lplock' || s.url?.includes('lock')
-                           ) || false;
+    // Enhanced LP lock detection - check multiple sources
+    const liquidityLocked = this.checkLiquidityLocked(dexData, birdeyeData, securityData);
 
-    // Dev wallet checks
-    const devWalletLocked = securityData.ownershipRenounced ||
-                           securityData.mintDisabled ||
-                           securityData.freezeDisabled || false;
+    // Dev wallet checks - more comprehensive
+    const devWalletLocked = this.checkDevWalletLocked(dexData, securityData);
 
     return {
       holderConcentration,
@@ -312,6 +306,114 @@ export class TokenAnalyzer {
       liquidityLocked,
       tokenAge,
     };
+  }
+
+  /**
+   * Enhanced LP lock detection - checks multiple data sources
+   */
+  private checkLiquidityLocked(dexData: any, birdeyeData: any, securityData: any): boolean {
+    // 1. Check Birdeye security data
+    if (securityData.isLpBurned === true || securityData.lpLocked === true) {
+      return true;
+    }
+
+    // 2. Check Birdeye top-level data
+    if (birdeyeData?.isLpBurned === true || birdeyeData?.lpLocked === true) {
+      return true;
+    }
+
+    // 3. Check DexScreener info for lock indicators
+    const info = dexData?.info || {};
+    const socials = info.socials || [];
+
+    // Check for explicit LP lock social links
+    const hasLockSocial = socials.some((s: any) => {
+      const type = (s.type || '').toLowerCase();
+      const url = (s.url || '').toLowerCase();
+      return type === 'lplock' ||
+             type === 'lock' ||
+             url.includes('lock') ||
+             url.includes('burn') ||
+             url.includes('unicrypt') ||
+             url.includes('pinksale') ||
+             url.includes('mudra') ||
+             url.includes('team.finance') ||
+             url.includes('dx.app');
+    });
+
+    if (hasLockSocial) return true;
+
+    // 4. Check DexScreener labels/tags
+    const labels = dexData?.labels || [];
+    const hasLockLabel = labels.some((label: string) => {
+      const l = label.toLowerCase();
+      return l.includes('lock') || l.includes('burn') || l.includes('renounced');
+    });
+
+    if (hasLockLabel) return true;
+
+    // 5. Check for burnt LP by checking if LP tokens sent to dead address
+    // DexScreener sometimes includes this in pair info
+    if (dexData?.liquidity?.locked === true || dexData?.liquidity?.burnt === true) {
+      return true;
+    }
+
+    // 6. Check websites/links for lock services
+    const websites = info.websites || [];
+    const hasLockWebsite = websites.some((w: any) => {
+      const url = (w.url || w || '').toLowerCase();
+      return url.includes('unicrypt') ||
+             url.includes('pinksale') ||
+             url.includes('mudra') ||
+             url.includes('team.finance') ||
+             url.includes('dx.app');
+    });
+
+    if (hasLockWebsite) return true;
+
+    // 7. Check description/header for lock keywords
+    const header = (info.header || '').toLowerCase();
+    const description = (info.description || '').toLowerCase();
+    if (header.includes('lp lock') || header.includes('lp burn') ||
+        description.includes('lp lock') || description.includes('lp burn') ||
+        description.includes('liquidity locked') || description.includes('liquidity burned')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Enhanced dev wallet check
+   */
+  private checkDevWalletLocked(dexData: any, securityData: any): boolean {
+    // Check Birdeye security data
+    if (securityData.ownershipRenounced === true ||
+        securityData.mintDisabled === true ||
+        securityData.freezeDisabled === true) {
+      return true;
+    }
+
+    // Check DexScreener labels
+    const labels = dexData?.labels || [];
+    if (labels.some((l: string) => {
+      const label = l.toLowerCase();
+      return label.includes('renounced') || label.includes('immutable');
+    })) {
+      return true;
+    }
+
+    // Check info for renounced mentions
+    const info = dexData?.info || {};
+    const header = (info.header || '').toLowerCase();
+    const description = (info.description || '').toLowerCase();
+
+    if (header.includes('renounced') || description.includes('renounced') ||
+        header.includes('immutable') || description.includes('mint disabled')) {
+      return true;
+    }
+
+    return false;
   }
 
   private analyzeSocial(tokenData: TokenData, dexData: any): SocialSignal {

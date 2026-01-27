@@ -18,13 +18,17 @@ export class TokenScanner {
   private paperTradeInterval: NodeJS.Timeout | null = null;
   private mandatoryBuySignalInterval: NodeJS.Timeout | null = null;
   private alphaMonitorInterval: NodeJS.Timeout | null = null;
+  private newPairsScanInterval: NodeJS.Timeout | null = null; // For scanning very new tokens
+  private positionUpdateInterval: NodeJS.Timeout | null = null; // For updating paper trade prices
   private alertCallbacks: Array<(analysis: AnalysisResult) => void> = [];
   private scanNotifyCallbacks: Array<(tokenInfo: { address: string; name?: string; symbol?: string; score?: number; confidence?: number; isAlpha?: boolean }) => void> = [];
   private buySignalCallbacks: Array<(analysis: AnalysisResult) => void> = [];
   private forcedBuySignalCallbacks: Array<(analysis: AnalysisResult, reason: string) => void> = [];
   private alphaPickCallbacks: Array<(analysis: AnalysisResult, reason: string) => void> = [];
   private hundredXCallbacks: Array<(tokenData: any, pumpReason: string) => void> = [];
+  private newPairCallbacks: Array<(analysis: AnalysisResult, ageMinutes: number) => void> = []; // Callbacks for new pair alerts
   private scannedTokens: Set<string> = new Set(); // Track scanned tokens to avoid duplicates
+  private newPairsScanned: Set<string> = new Set(); // Track new pairs separately
   private userScanIntervals: Map<number, NodeJS.Timeout> = new Map(); // Per-user scan intervals
   private userScannedTokens: Map<number, Set<string>> = new Map(); // Per-user scanned tokens
   private lastBuySignalTime: Date = new Date();
@@ -33,6 +37,7 @@ export class TokenScanner {
     alertsTriggered: 0,
     buySignalsSent: 0,
     alphaPicks: 0,
+    newPairsFound: 0,
     lastScanTime: Date.now(),
   };
 
@@ -117,6 +122,13 @@ export class TokenScanner {
    */
   onForcedBuySignal(callback: (analysis: AnalysisResult, reason: string) => void): void {
     this.forcedBuySignalCallbacks.push(callback);
+  }
+
+  /**
+   * Register callback for new pair alerts (very fresh tokens)
+   */
+  onNewPair(callback: (analysis: AnalysisResult, ageMinutes: number) => void): void {
+    this.newPairCallbacks.push(callback);
   }
 
   /**
@@ -228,6 +240,232 @@ export class TokenScanner {
     const uniqueTokens = [...new Set(tokens)];
     logger.info(`📊 Final count: ${uniqueTokens.length} unique launchpad tokens to analyze`);
     return uniqueTokens;
+  }
+
+  /**
+   * Get VERY NEW pairs (seconds to minutes old) with low market cap
+   * This targets the $3k-$100k MC range that users want
+   */
+  private async getNewPairs(): Promise<{ address: string; ageMinutes: number; marketCap: number; liquidity: number }[]> {
+    const newPairs: { address: string; ageMinutes: number; marketCap: number; liquidity: number }[] = [];
+
+    try {
+      const newPairsConfig = config.scanner.newPairs;
+      logger.info('🆕 Scanning for NEW pairs (low MC, fresh tokens)...');
+
+      // Get all new pairs from DexScreener
+      const allPairs = await dexScreener.getNewPairs();
+      const now = Date.now();
+
+      for (const pair of allPairs) {
+        if (!pair.baseToken?.address) continue;
+        if (!pair.pairCreatedAt) continue;
+
+        // Calculate age in minutes
+        const createdAt = new Date(pair.pairCreatedAt).getTime();
+        const ageMinutes = (now - createdAt) / (1000 * 60);
+
+        // Skip if too old
+        if (ageMinutes > newPairsConfig.maxAgeMinutes) continue;
+
+        const liquidity = parseFloat(pair.liquidity?.usd || '0');
+        const marketCap = parseFloat(pair.marketCap || pair.fdv || '0');
+
+        // Apply new pairs filter criteria
+        if (
+          liquidity >= newPairsConfig.minLiquidityUsd &&
+          liquidity <= newPairsConfig.maxLiquidityUsd &&
+          marketCap >= newPairsConfig.minMarketCapUsd &&
+          marketCap <= newPairsConfig.maxMarketCapUsd
+        ) {
+          // Skip if already scanned in this session
+          if (this.newPairsScanned.has(pair.baseToken.address)) continue;
+
+          newPairs.push({
+            address: pair.baseToken.address,
+            ageMinutes,
+            marketCap,
+            liquidity,
+          });
+
+          logger.info(`🆕 NEW PAIR: ${pair.baseToken.symbol || 'Unknown'} | Age: ${ageMinutes.toFixed(1)}m | MC: $${(marketCap / 1000).toFixed(1)}k | Liq: $${(liquidity / 1000).toFixed(1)}k`);
+        }
+      }
+
+      // Sort by age (newest first)
+      newPairs.sort((a, b) => a.ageMinutes - b.ageMinutes);
+
+      logger.info(`🆕 Found ${newPairs.length} new pairs in target range`);
+    } catch (error) {
+      logger.error('Error fetching new pairs:', error);
+    }
+
+    return newPairs;
+  }
+
+  /**
+   * Scan for new pairs (very fresh, low MC tokens)
+   */
+  private async scanNewPairs(): Promise<void> {
+    try {
+      const newPairs = await this.getNewPairs();
+
+      for (const pair of newPairs) {
+        // Mark as scanned
+        this.newPairsScanned.add(pair.address);
+        this.stats.newPairsFound++;
+
+        // Analyze the token
+        const analysis = await tokenAnalyzer.analyzeToken(pair.address);
+        if (!analysis) continue;
+
+        logger.info(
+          `🆕 NEW PAIR ANALYSIS: ${analysis.token.symbol} | ` +
+          `Age: ${pair.ageMinutes.toFixed(1)}m | ` +
+          `MC: $${(pair.marketCap / 1000).toFixed(1)}k | ` +
+          `Score: ${analysis.overallScore.toFixed(0)} | ` +
+          `Confidence: ${(analysis.confidence * 100).toFixed(0)}%`
+        );
+
+        // Notify callbacks about new pair
+        for (const callback of this.newPairCallbacks) {
+          try {
+            callback(analysis, pair.ageMinutes);
+          } catch (error) {
+            logger.error('Error in new pair callback:', error);
+          }
+        }
+
+        // Also trigger regular alpha/buy signal logic
+        if (analysis.overallScore >= ALPHA_SCORE_THRESHOLD) {
+          const reason = `🆕 Fresh token (${pair.ageMinutes.toFixed(0)}m old), MC: $${(pair.marketCap / 1000).toFixed(1)}k`;
+          this.sendAlphaPick(analysis, reason);
+        }
+
+        if (analysis.overallScore >= BUY_SIGNAL_SCORE_THRESHOLD) {
+          this.sendBuySignal(analysis);
+        }
+
+        // Small delay to avoid rate limits
+        await this.sleep(500);
+      }
+    } catch (error) {
+      logger.error('Error in scanNewPairs:', error);
+    }
+  }
+
+  /**
+   * Start new pairs scanning (for very fresh, low MC tokens)
+   */
+  startNewPairsScanning(): void {
+    if (this.newPairsScanInterval) {
+      logger.warn('New pairs scanning already running');
+      return;
+    }
+
+    const newPairsConfig = config.scanner.newPairs;
+    if (!newPairsConfig.enabled) {
+      logger.info('New pairs scanning is disabled in config');
+      return;
+    }
+
+    logger.info('🆕 Starting NEW PAIRS scanning (low MC, fresh tokens)');
+    logger.info(`   Min Liquidity: $${newPairsConfig.minLiquidityUsd}`);
+    logger.info(`   Max Liquidity: $${newPairsConfig.maxLiquidityUsd}`);
+    logger.info(`   Min MC: $${newPairsConfig.minMarketCapUsd}`);
+    logger.info(`   Max MC: $${newPairsConfig.maxMarketCapUsd}`);
+    logger.info(`   Max Age: ${newPairsConfig.maxAgeMinutes} minutes`);
+    logger.info(`   Scan Interval: ${newPairsConfig.scanIntervalMs / 1000}s`);
+
+    // Run initial scan
+    this.scanNewPairs();
+
+    // Schedule periodic scans
+    this.newPairsScanInterval = setInterval(() => {
+      this.scanNewPairs();
+    }, newPairsConfig.scanIntervalMs);
+  }
+
+  /**
+   * Stop new pairs scanning
+   */
+  stopNewPairsScanning(): void {
+    if (this.newPairsScanInterval) {
+      clearInterval(this.newPairsScanInterval);
+      this.newPairsScanInterval = null;
+      logger.info('New pairs scanning stopped');
+    }
+  }
+
+  /**
+   * Start position monitoring (updates paper trade prices periodically)
+   */
+  startPositionMonitoring(): void {
+    if (this.positionUpdateInterval) {
+      logger.warn('Position monitoring already running');
+      return;
+    }
+
+    const intervalMs = config.scanner.positionUpdateIntervalMs || 60000;
+    logger.info(`📊 Starting position monitoring (every ${intervalMs / 1000}s)`);
+
+    // Update positions periodically
+    this.positionUpdateInterval = setInterval(async () => {
+      try {
+        await this.updateAllPositions();
+      } catch (error) {
+        logger.error('Error in position monitoring:', error);
+      }
+    }, intervalMs);
+
+    // Run initial update
+    this.updateAllPositions();
+  }
+
+  /**
+   * Stop position monitoring
+   */
+  stopPositionMonitoring(): void {
+    if (this.positionUpdateInterval) {
+      clearInterval(this.positionUpdateInterval);
+      this.positionUpdateInterval = null;
+      logger.info('Position monitoring stopped');
+    }
+  }
+
+  /**
+   * Update all open positions with current prices
+   */
+  private async updateAllPositions(): Promise<void> {
+    try {
+      // Get all users with open positions
+      const allPositions = db.getAllOpenPositions();
+
+      if (allPositions.length === 0) return;
+
+      logger.debug(`Updating ${allPositions.length} open positions...`);
+
+      for (const position of allPositions) {
+        try {
+          await tradingEngine.updatePosition(position);
+
+          // Check if position should be auto-closed
+          if (tradingEngine.shouldClosePosition(position, position.userId)) {
+            logger.info(`Auto-closing position ${position.symbol} for user ${position.userId}`);
+            await tradingEngine.sell(position, position.type === 'paper');
+          }
+        } catch (error) {
+          logger.debug(`Error updating position ${position.symbol}:`, error);
+        }
+
+        // Small delay between updates
+        await this.sleep(200);
+      }
+
+      logger.debug(`Position update complete`);
+    } catch (error) {
+      logger.error('Error updating all positions:', error);
+    }
   }
 
   /**
