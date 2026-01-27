@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { config, TRADING_PRESETS } from '../config';
-import tokenAnalyzer from '../analyzer/tokenAnalyzer';
+import tokenAnalyzer, { AnalysisError } from '../analyzer/tokenAnalyzer';
 import tradingEngine from '../trading/tradingEngine';
 import tokenScanner from '../scanner/tokenScanner';
 import patternLearner from '../learning/patternLearner';
@@ -9,6 +9,28 @@ import walletManager from '../services/walletManager';
 import subscriptionManager from '../services/subscriptionManager';
 import logger from '../utils/logger';
 import { AnalysisResult } from '../types';
+
+// Helper to format analysis errors for users
+function formatAnalysisError(error: AnalysisError | undefined): string {
+  if (!error) {
+    return '❌ Failed to analyze token. Please try again.';
+  }
+
+  switch (error.type) {
+    case 'invalid_address':
+      return `❌ *Invalid Contract Address*\n\n${error.details || 'Please check the address format.'}`;
+    case 'not_found':
+      return `❌ *Token Not Found*\n\n${error.details || 'Token may not be listed yet. Try again in a few minutes if this is a new token.'}`;
+    case 'timeout':
+      return `⏱️ *Request Timed Out*\n\n${error.details || 'Please try again.'}`;
+    case 'rate_limit':
+      return `🚫 *Too Many Requests*\n\n${error.details || 'Please wait a moment and try again.'}`;
+    case 'api_error':
+      return `⚠️ *API Error*\n\n${error.details || 'There was a problem fetching token data. Please try again later.'}`;
+    default:
+      return `❌ *Analysis Failed*\n\n${error.details || 'An unexpected error occurred. Please try again.'}`;
+  }
+}
 
 interface PendingAction {
   action: string;
@@ -1118,10 +1140,11 @@ Use /hunt to start hunting again!
     try {
       await this.bot.sendMessage(chatId, '🔍 Analyzing token... This may take a moment.');
 
-      const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
+      const { result: analysis, error } = await tokenAnalyzer.analyzeTokenWithError(contractAddress);
 
       if (!analysis) {
-        await this.bot.sendMessage(chatId, '❌ Failed to analyze token. Make sure the contract address is valid.');
+        const errorMessage = formatAnalysisError(error);
+        await this.bot.sendMessage(chatId, errorMessage, { parse_mode: 'Markdown' });
         return;
       }
 
@@ -1345,10 +1368,11 @@ Use /hunt to start hunting again!
 
     await this.bot.sendMessage(chatId, '🔍 Analyzing and executing trade...');
 
-    const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
+    const { result: analysis, error } = await tokenAnalyzer.analyzeTokenWithError(contractAddress);
 
     if (!analysis) {
-      await this.bot.sendMessage(chatId, '❌ Failed to analyze token.');
+      const errorMessage = formatAnalysisError(error);
+      await this.bot.sendMessage(chatId, errorMessage, { parse_mode: 'Markdown' });
       return;
     }
 
@@ -1555,10 +1579,11 @@ Use /hunt to start hunting again!
     try {
       await this.bot.sendMessage(chatId, '🔍 Analyzing token for purchase...');
 
-      const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
+      const { result: analysis, error } = await tokenAnalyzer.analyzeTokenWithError(contractAddress);
 
       if (!analysis) {
-        await this.bot.sendMessage(chatId, '❌ Failed to analyze token.');
+        const errorMessage = formatAnalysisError(error);
+        await this.bot.sendMessage(chatId, errorMessage, { parse_mode: 'Markdown' });
         return;
       }
 
@@ -1592,10 +1617,11 @@ Use /hunt to start hunting again!
     try {
       await this.bot.sendMessage(chatId, '🔍 Fetching detailed analysis...');
 
-      const analysis = await tokenAnalyzer.analyzeToken(contractAddress);
+      const { result: analysis, error } = await tokenAnalyzer.analyzeTokenWithError(contractAddress);
 
       if (!analysis) {
-        await this.bot.sendMessage(chatId, '❌ Failed to fetch token details.');
+        const errorMessage = formatAnalysisError(error);
+        await this.bot.sendMessage(chatId, errorMessage, { parse_mode: 'Markdown' });
         return;
       }
 

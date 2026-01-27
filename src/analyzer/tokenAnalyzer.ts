@@ -4,34 +4,155 @@ import { RUNNER_PATTERNS } from '../config';
 import logger from '../utils/logger';
 import db from '../database';
 
+// Analysis error types for better user feedback
+export interface AnalysisError {
+  type: 'invalid_address' | 'not_found' | 'api_error' | 'timeout' | 'rate_limit' | 'unknown';
+  message: string;
+  details?: string;
+}
+
+export interface AnalysisResultWithError {
+  result: AnalysisResult | null;
+  error?: AnalysisError;
+}
+
+// Validate Solana address format
+function isValidSolanaAddress(address: string): boolean {
+  // Solana addresses are base58 encoded, 32-44 characters
+  const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  return base58Regex.test(address);
+}
+
+// Safe parseFloat that handles NaN and invalid values
+function safeParseFloat(value: string | number | undefined | null, defaultValue: number = 0): number {
+  if (value === undefined || value === null) return defaultValue;
+  const parsed = typeof value === 'number' ? value : parseFloat(value);
+  return isNaN(parsed) || !isFinite(parsed) ? defaultValue : parsed;
+}
+
 export class TokenAnalyzer {
+  // Main analysis method - returns null on failure
   async analyzeToken(contractAddress: string): Promise<AnalysisResult | null> {
+    const result = await this.analyzeTokenWithError(contractAddress);
+    return result.result;
+  }
+
+  // Enhanced analysis method - returns detailed error info
+  async analyzeTokenWithError(contractAddress: string): Promise<AnalysisResultWithError> {
     try {
       logger.info(`Starting analysis for token: ${contractAddress}`);
 
-      // Fetch data from multiple sources
-      const [dexData, birdeyeData, heliusData] = await Promise.all([
+      // Validate contract address format
+      if (!isValidSolanaAddress(contractAddress)) {
+        logger.warn(`Invalid Solana address format: ${contractAddress}`);
+        return {
+          result: null,
+          error: {
+            type: 'invalid_address',
+            message: 'Invalid contract address format',
+            details: 'Solana addresses are 32-44 characters using base58 encoding'
+          }
+        };
+      }
+
+      // Fetch data from multiple sources using Promise.allSettled
+      // This ensures one API failure doesn't block the entire analysis
+      const [dexResult, birdeyeResult, heliusResult] = await Promise.allSettled([
         dexScreener.getTokenData(contractAddress),
         birdeye.getTokenOverview(contractAddress),
         helius.getAsset(contractAddress),
       ]);
 
-      if (!dexData) {
-        logger.warn(`No DexScreener data found for ${contractAddress}`);
-        return null;
+      // Extract results (null if rejected)
+      const dexData = dexResult.status === 'fulfilled' ? dexResult.value : null;
+      const birdeyeData = birdeyeResult.status === 'fulfilled' ? birdeyeResult.value : null;
+      const heliusData = heliusResult.status === 'fulfilled' ? heliusResult.value : null;
+
+      // Log API results for debugging
+      if (dexResult.status === 'rejected') {
+        logger.warn(`DexScreener API failed for ${contractAddress}:`, dexResult.reason);
+      }
+      if (birdeyeResult.status === 'rejected') {
+        logger.debug(`Birdeye API failed for ${contractAddress} (optional):`, birdeyeResult.reason);
+      }
+      if (heliusResult.status === 'rejected') {
+        logger.debug(`Helius API failed for ${contractAddress} (optional):`, heliusResult.reason);
       }
 
-      // Build token data
+      // DexScreener is required - without it we can't analyze
+      if (!dexData) {
+        logger.warn(`No DexScreener data found for ${contractAddress}`);
+
+        // Try to provide specific error info
+        const errorResult = await dexScreener.getTokenDataWithError(contractAddress);
+        if (errorResult.error) {
+          const errorMap: Record<string, AnalysisError> = {
+            'not_found': {
+              type: 'not_found',
+              message: 'Token not found on DexScreener',
+              details: 'This token may be too new (< 1 min) or not yet listed on any DEX'
+            },
+            'timeout': {
+              type: 'timeout',
+              message: 'Request timed out',
+              details: 'DexScreener is taking too long to respond. Please try again.'
+            },
+            'rate_limit': {
+              type: 'rate_limit',
+              message: 'Too many requests',
+              details: 'Please wait a moment and try again.'
+            },
+            'server_error': {
+              type: 'api_error',
+              message: 'DexScreener server error',
+              details: 'The API is experiencing issues. Please try again later.'
+            },
+            'network': {
+              type: 'api_error',
+              message: 'Network error',
+              details: 'Unable to reach DexScreener. Check your connection.'
+            }
+          };
+          return { result: null, error: errorMap[errorResult.error.type] || { type: 'unknown', message: 'Unknown error' } };
+        }
+
+        return {
+          result: null,
+          error: {
+            type: 'not_found',
+            message: 'Token not found',
+            details: 'Token may not be listed yet or the address may be incorrect'
+          }
+        };
+      }
+
+      // Validate required data from DexScreener
+      if (!dexData.baseToken?.symbol || !dexData.baseToken?.name) {
+        logger.warn(`Invalid token data structure for ${contractAddress}`);
+        return {
+          result: null,
+          error: {
+            type: 'not_found',
+            message: 'Invalid token data',
+            details: 'Token data is incomplete. It may be too new or delisted.'
+          }
+        };
+      }
+
+      // Get holder count (optional - don't fail if unavailable)
+      const holderCount = await helius.getTokenHolders(contractAddress);
+
+      // Build token data with safe parsing
       const tokenData: TokenData = {
         contractAddress,
-        symbol: dexData.baseToken?.symbol || 'UNKNOWN',
-        name: dexData.baseToken?.name || 'Unknown Token',
-        price: parseFloat(dexData.priceUsd || '0'),
-        priceChange24h: dexData.priceChange?.h24 || 0,
-        volume24h: parseFloat(dexData.volume?.h24 || '0'),
-        liquidity: parseFloat(dexData.liquidity?.usd || '0'),
-        marketCap: parseFloat(dexData.marketCap || '0'),
-        holders: await helius.getTokenHolders(contractAddress) || 0,
+        symbol: dexData.baseToken.symbol,
+        name: dexData.baseToken.name,
+        price: safeParseFloat(dexData.priceUsd, 0),
+        priceChange24h: safeParseFloat(dexData.priceChange?.h24, 0),
+        volume24h: safeParseFloat(dexData.volume?.h24, 0),
+        liquidity: safeParseFloat(dexData.liquidity?.usd, 0),
+        marketCap: safeParseFloat(dexData.marketCap, 0),
+        holders: holderCount ?? 0,
         createdAt: new Date(dexData.pairCreatedAt || Date.now()),
         dexScreenerData: dexData,
         birdeyeData: birdeyeData,
@@ -69,10 +190,17 @@ export class TokenAnalyzer {
 
       logger.info(`Analysis complete for ${tokenData.symbol}: Score ${overallScore.toFixed(2)}, Confidence ${confidence.toFixed(2)}`);
 
-      return result;
+      return { result };
     } catch (error) {
       logger.error(`Error analyzing token ${contractAddress}:`, error);
-      return null;
+      return {
+        result: null,
+        error: {
+          type: 'unknown',
+          message: 'Analysis failed',
+          details: error instanceof Error ? error.message : 'Unknown error occurred'
+        }
+      };
     }
   }
 
@@ -80,21 +208,25 @@ export class TokenAnalyzer {
     const signals: WalletSignal[] = [];
 
     // Analyze based on volume/liquidity patterns - high volume with good liquidity suggests smart money
-    const volume24h = parseFloat(dexData.volume?.h24 || '0');
-    const liquidity = parseFloat(dexData.liquidity?.usd || '0');
+    const volume24h = safeParseFloat(dexData.volume?.h24, 0);
+    const liquidity = safeParseFloat(dexData.liquidity?.usd, 0);
     const volumeToLiquidityRatio = liquidity > 0 ? volume24h / liquidity : 0;
 
     // High volume relative to liquidity can indicate smart money accumulation
     const isSmartMoney = volumeToLiquidityRatio > 2 && volume24h > 50000;
 
     // Whale detection based on large transactions (high volume in short time)
-    const volume1h = parseFloat(dexData.volume?.h1 || '0');
-    const volume6h = parseFloat(dexData.volume?.h6 || '0');
-    const isWhale = volume1h > 10000 && (volume1h / Math.max(volume6h / 6, 1)) > 3;
+    const volume1h = safeParseFloat(dexData.volume?.h1, 0);
+    const volume6h = safeParseFloat(dexData.volume?.h6, 0);
+    // Safe division: average hourly volume over 6h, minimum 1 to avoid division by zero
+    const avgHourlyVolume = Math.max(volume6h / 6, 1);
+    const isWhale = volume1h > 10000 && (volume1h / avgHourlyVolume) > 3;
 
-    // Check transaction count patterns
+    // Check transaction count patterns - ensure safe division
     const txns24h = dexData.txns?.h24 || { buys: 0, sells: 0 };
-    const buyPressure = txns24h.buys / Math.max(txns24h.sells, 1);
+    const buys = safeParseFloat(txns24h.buys, 0);
+    const sells = safeParseFloat(txns24h.sells, 0);
+    const buyPressure = sells > 0 ? buys / sells : (buys > 0 ? 2 : 1); // If no sells, assume bullish if there are buys
 
     signals.push({
       isSmartMoney,
@@ -109,25 +241,37 @@ export class TokenAnalyzer {
   }
 
   private analyzeTechnical(tokenData: TokenData, dexData: any): TechnicalSignal {
-    const volumeChange = dexData.volume?.h24 / (dexData.volume?.h6 || 1);
-    const volumeBreakout = volumeChange > 2.0; // 100%+ volume increase
+    // Safe volume calculations
+    const volume24h = safeParseFloat(dexData.volume?.h24, 0);
+    const volume6h = safeParseFloat(dexData.volume?.h6, 0);
 
-    const liquidityScore = Math.min(tokenData.liquidity / 100000, 1.0); // Normalized to $100k
+    // Calculate volume change safely - if 6h volume is 0, can't determine breakout
+    let volumeBreakout = false;
+    if (volume6h > 0) {
+      const volumeChange = volume24h / volume6h;
+      volumeBreakout = isFinite(volumeChange) && volumeChange > 2.0; // 100%+ volume increase
+    }
+
+    // Normalized liquidity score (0-1) with safe division
+    const liquidityScore = tokenData.liquidity > 0
+      ? Math.min(tokenData.liquidity / 100000, 1.0)
+      : 0;
 
     let priceAction: 'bullish' | 'bearish' | 'neutral' = 'neutral';
     if (tokenData.priceChange24h > 20) priceAction = 'bullish';
     else if (tokenData.priceChange24h < -20) priceAction = 'bearish';
 
-    // Simple RSI estimation from price change
-    const rsi = 50 + (tokenData.priceChange24h / 2);
+    // Simple RSI estimation from price change (clamped 0-100)
+    const rsi = Math.max(0, Math.min(100, 50 + (tokenData.priceChange24h / 2)));
 
-    const volatility = Math.abs(tokenData.priceChange24h) / 100;
+    // Volatility as a percentage (capped at 1.0)
+    const volatility = Math.min(Math.abs(tokenData.priceChange24h) / 100, 1.0);
 
     return {
       volumeBreakout,
       liquidityScore,
       priceAction,
-      rsi: Math.max(0, Math.min(100, rsi)),
+      rsi,
       volatility,
     };
   }
@@ -181,15 +325,28 @@ export class TokenAnalyzer {
     const socialPresence = (hasTwitter ? 1 : 0) + (hasTelegram ? 1 : 0) + (hasWebsite ? 1 : 0);
 
     // Estimate trending score based on volume growth and social presence
-    const volumeGrowth = dexData.volume?.h1 && dexData.volume?.h6 ?
-      (parseFloat(dexData.volume.h1) / (parseFloat(dexData.volume.h6) / 6)) : 1;
+    const volume1h = safeParseFloat(dexData.volume?.h1, 0);
+    const volume6h = safeParseFloat(dexData.volume?.h6, 0);
 
-    const trendingScore = Math.min(1, (volumeGrowth - 1) * 0.5 + (socialPresence * 0.2));
+    // Safe volume growth calculation
+    let volumeGrowth = 1;
+    if (volume6h > 0) {
+      const avgHourlyVolume = volume6h / 6;
+      if (avgHourlyVolume > 0) {
+        volumeGrowth = volume1h / avgHourlyVolume;
+        // Sanity check - cap at reasonable values
+        volumeGrowth = Math.min(volumeGrowth, 10);
+      }
+    }
+
+    const trendingScore = Math.max(0, Math.min(1, (volumeGrowth - 1) * 0.5 + (socialPresence * 0.2)));
 
     // Determine sentiment from price action and buy/sell ratio
     const priceChange = tokenData.priceChange24h;
     const txns = dexData.txns?.h24 || { buys: 0, sells: 0 };
-    const buyRatio = txns.buys / Math.max(txns.sells, 1);
+    const buys = safeParseFloat(txns.buys, 0);
+    const sells = safeParseFloat(txns.sells, 0);
+    const buyRatio = sells > 0 ? buys / sells : (buys > 0 ? 2 : 1);
 
     let sentiment: 'positive' | 'negative' | 'neutral' = 'neutral';
     if (priceChange > 20 && buyRatio > 1.2) sentiment = 'positive';
@@ -199,7 +356,7 @@ export class TokenAnalyzer {
       twitterMentions: hasTwitter ? 10 : 0, // Placeholder - would need Twitter API
       influencerEngagement: socialPresence > 2 ? 5 : socialPresence,
       sentiment,
-      trendingScore: Math.max(0, Math.min(1, trendingScore)),
+      trendingScore,
     };
   }
 
