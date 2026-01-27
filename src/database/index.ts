@@ -747,6 +747,33 @@ class DatabaseManager {
     }));
   }
 
+  /**
+   * Get ALL open positions across all users (for position monitoring)
+   */
+  getAllOpenPositions(): TradePosition[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM positions WHERE status = 'open'
+    `);
+    const rows = stmt.all() as any[];
+
+    return rows.map(row => ({
+      id: row.id,
+      userId: row.user_id,
+      contractAddress: row.contract_address,
+      symbol: row.symbol,
+      entryPrice: row.entry_price,
+      currentPrice: row.current_price,
+      amount: row.amount,
+      solInvested: row.sol_invested,
+      pnl: row.pnl,
+      pnlPercentage: row.pnl_percentage,
+      openedAt: new Date(row.opened_at),
+      closedAt: row.closed_at ? new Date(row.closed_at) : undefined,
+      status: row.status,
+      type: row.type,
+    }));
+  }
+
   saveLearningData(data: LearningData): void {
     const stmt = this.db.prepare(`
       INSERT INTO learning_data (pattern_id, trade_id, outcome, return_percentage, entry_signals)

@@ -32,6 +32,18 @@ export const config = {
     minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '10000'),
     minVolume24hUsd: parseFloat(process.env.MIN_VOLUME_24H_USD || '50000'),
     mandatoryBuySignalIntervalMs: parseInt(process.env.MANDATORY_BUY_SIGNAL_INTERVAL_MS || '300000'), // 5 minutes
+    // New pairs scanning config (very fresh tokens)
+    newPairs: {
+      enabled: process.env.NEW_PAIRS_ENABLED !== 'false', // Enabled by default
+      scanIntervalMs: parseInt(process.env.NEW_PAIRS_SCAN_INTERVAL_MS || '30000'), // 30 seconds for new pairs
+      minLiquidityUsd: parseFloat(process.env.NEW_PAIRS_MIN_LIQUIDITY_USD || '3000'), // $3k min for new tokens
+      maxLiquidityUsd: parseFloat(process.env.NEW_PAIRS_MAX_LIQUIDITY_USD || '50000'), // $50k max (filter out established tokens)
+      minMarketCapUsd: parseFloat(process.env.NEW_PAIRS_MIN_MC_USD || '3000'), // $3k min MC
+      maxMarketCapUsd: parseFloat(process.env.NEW_PAIRS_MAX_MC_USD || '100000'), // $100k max MC (catches 3k-100k range)
+      maxAgeMinutes: parseInt(process.env.NEW_PAIRS_MAX_AGE_MINUTES || '30'), // Only tokens < 30 min old
+    },
+    // Position monitoring
+    positionUpdateIntervalMs: parseInt(process.env.POSITION_UPDATE_INTERVAL_MS || '60000'), // Update positions every 1 minute
   },
   subscription: {
     freeAdminUsername: process.env.FREE_ADMIN_USERNAME || 'mabyconnect2000',

@@ -655,6 +655,62 @@ ${this.getPotentialText(analysis)}
       }
     });
 
+    // New pairs callback (fresh low MC tokens)
+    tokenScanner.onNewPair(async (analysis: AnalysisResult, ageMinutes: number) => {
+      // Send to all active hunters
+      for (const [chatId, isActive] of this.activeHunters.entries()) {
+        if (isActive) {
+          try {
+            const mcDisplay = analysis.token.marketCap > 1000
+              ? `$${(analysis.token.marketCap / 1000).toFixed(1)}k`
+              : `$${analysis.token.marketCap.toFixed(0)}`;
+
+            const liquidityDisplay = analysis.token.liquidity > 1000
+              ? `$${(analysis.token.liquidity / 1000).toFixed(1)}k`
+              : `$${analysis.token.liquidity.toFixed(0)}`;
+
+            const scoreEmoji = analysis.overallScore >= 30 ? '🔥' :
+                              analysis.overallScore >= 20 ? '⭐' : '📊';
+
+            const message = `
+🆕 *FRESH TOKEN DETECTED!*
+
+*${analysis.token.symbol}* (${analysis.token.name})
+\`${analysis.token.contractAddress}\`
+
+⏱️ Age: *${ageMinutes.toFixed(0)} minutes old*
+💰 MC: *${mcDisplay}*
+💧 Liquidity: *${liquidityDisplay}*
+${scoreEmoji} Score: *${analysis.overallScore.toFixed(0)}/100*
+🎯 Confidence: *${(analysis.confidence * 100).toFixed(0)}%*
+
+${analysis.fundamental.liquidityLocked ? '🔒 LP Locked' : '⚠️ LP Not Locked'}
+${analysis.fundamental.devWalletLocked ? '✅ Dev Renounced' : ''}
+
+🔗 [DexScreener](https://dexscreener.com/solana/${analysis.token.contractAddress})
+            `;
+
+            const keyboard = {
+              inline_keyboard: [
+                [
+                  { text: '💰 Buy', callback_data: `buy:${analysis.token.contractAddress}` },
+                  { text: '📊 Full Analysis', callback_data: `details:${analysis.token.contractAddress}` },
+                ],
+              ],
+            };
+
+            await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'Markdown',
+              disable_web_page_preview: true,
+              reply_markup: keyboard,
+            });
+          } catch (error) {
+            logger.error(`Failed to send new pair alert to chat ${chatId}:`, error);
+          }
+        }
+      }
+    });
+
     tokenScanner.onAlert(async (analysis: AnalysisResult) => {
       // Send to all active hunters with animation
       for (const [chatId, isActive] of this.activeHunters.entries()) {
@@ -1036,6 +1092,12 @@ Ready to hunt some runners! 🚀
       // Start alpha monitoring if not already running
       tokenScanner.startAlphaMonitoring();
 
+      // Start new pairs scanning (for very fresh low MC tokens)
+      tokenScanner.startNewPairsScanning();
+
+      // Start position monitoring (updates paper trade prices)
+      tokenScanner.startPositionMonitoring();
+
       await this.sleep(1000);
       await this.bot.editMessageText(
         `✅ *Hunt Mode Active!*
@@ -1044,11 +1106,14 @@ Ready to hunt some runners! 🚀
 🤖 Paper trading ALL scanned tokens automatically
 ⭐ Alpha picks (score ≥29) are tracked
 🚀 100x moonshots are monitored
+🆕 NEW: Scanning fresh tokens ($3k-$100k MC)
 
 📊 *Features:*
 • 🔔 Real-time token alerts
 • ⭐ Alpha token badges
 • 📈 Automatic paper trades
+• 🆕 Fresh pair detection (< 30 min old)
+• 💰 Live price tracking for positions
 • 🧠 Learning from 100x winners
 
 Use /stop to deactivate your scanner`,
