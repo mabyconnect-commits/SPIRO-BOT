@@ -95,6 +95,7 @@ export class TradingEngine {
 
     const position: TradePosition = {
       id: crypto.randomUUID(),
+      userId: userId,
       contractAddress: analysis.token.contractAddress,
       symbol: analysis.token.symbol,
       entryPrice: tokenPrice,
@@ -209,6 +210,7 @@ export class TradingEngine {
 
       const position: TradePosition = {
         id: signature,
+        userId: userId,
         contractAddress: analysis.token.contractAddress,
         symbol: analysis.token.symbol,
         entryPrice: tokenPrice,
@@ -223,7 +225,7 @@ export class TradingEngine {
       };
 
       // Save position with user ID
-      this.savePositionForUser(userId, position);
+      db.savePosition(position);
 
       logger.info(
         `✅ REAL BUY: ${solAmount} SOL → ${tokenAmount.toFixed(2)} ${analysis.token.symbol} @ $${tokenPrice.toFixed(8)}`
@@ -269,15 +271,6 @@ export class TradingEngine {
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     return decrypted;
-  }
-
-  /**
-   * Save position for a specific user
-   */
-  private savePositionForUser(userId: number, position: TradePosition): void {
-    // Modify position to include user_id
-    const positionWithUser = { ...position, userId };
-    db.savePosition(positionWithUser as any);
   }
 
   /**
@@ -421,7 +414,7 @@ export class TradingEngine {
     try {
       const currentPrice = await jupiter.getTokenPrice(position.contractAddress);
 
-      if (currentPrice > 0) {
+      if (currentPrice !== null && currentPrice > 0) {
         position.currentPrice = currentPrice;
 
         const currentValue = position.amount * currentPrice;
@@ -431,6 +424,8 @@ export class TradingEngine {
         position.pnlPercentage = ((currentValue - investedValue) / investedValue) * 100;
 
         db.savePosition(position);
+      } else if (currentPrice === null) {
+        logger.warn(`Could not fetch price for position ${position.symbol} (${position.contractAddress})`);
       }
 
       return position;

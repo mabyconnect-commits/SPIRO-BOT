@@ -80,6 +80,7 @@ export interface PatternSignal {
 
 export interface TradePosition {
   id: string;
+  userId: number;
   contractAddress: string;
   symbol: string;
   entryPrice: number;

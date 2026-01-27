@@ -3003,8 +3003,9 @@ Try /confirmpayment again after sending.
 
       for (const trade of history) {
         const actionEmoji = trade.action === 'buy' ? '🟢' : '🔴';
+        const pnlPercentage = trade.pnl_percentage ?? 0;
         const pnlText = trade.action === 'sell' && trade.pnl !== 0
-          ? ` | PnL: ${trade.pnl > 0 ? '+' : ''}${trade.pnl_percentage?.toFixed(2) || 0}%`
+          ? ` | PnL: ${trade.pnl > 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%`
           : '';
 
         message += `${actionEmoji} *${trade.action.toUpperCase()}* ${trade.symbol}\n`;
@@ -3343,8 +3344,7 @@ Use /realtrade on when you're ready to trade with real funds.
       }
     } catch (error) {
       logger.error('Error in handleRealTrade:', error);
-      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
-      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred.');
+      await this.bot.sendMessage(msg.chat.id, '❌ An error occurred. Please try again.');
     }
   }
 

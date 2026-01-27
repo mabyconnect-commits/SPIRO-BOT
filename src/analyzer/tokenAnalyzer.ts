@@ -77,18 +77,32 @@ export class TokenAnalyzer {
   }
 
   private async analyzeWallets(contractAddress: string, dexData: any): Promise<WalletSignal[]> {
-    // This would integrate with wallet tracking
-    // For now, returning basic analysis based on available data
     const signals: WalletSignal[] = [];
 
-    // Placeholder: In production, you'd track specific wallets and check if they hold this token
+    // Analyze based on volume/liquidity patterns - high volume with good liquidity suggests smart money
+    const volume24h = parseFloat(dexData.volume?.h24 || '0');
+    const liquidity = parseFloat(dexData.liquidity?.usd || '0');
+    const volumeToLiquidityRatio = liquidity > 0 ? volume24h / liquidity : 0;
+
+    // High volume relative to liquidity can indicate smart money accumulation
+    const isSmartMoney = volumeToLiquidityRatio > 2 && volume24h > 50000;
+
+    // Whale detection based on large transactions (high volume in short time)
+    const volume1h = parseFloat(dexData.volume?.h1 || '0');
+    const volume6h = parseFloat(dexData.volume?.h6 || '0');
+    const isWhale = volume1h > 10000 && (volume1h / Math.max(volume6h / 6, 1)) > 3;
+
+    // Check transaction count patterns
+    const txns24h = dexData.txns?.h24 || { buys: 0, sells: 0 };
+    const buyPressure = txns24h.buys / Math.max(txns24h.sells, 1);
+
     signals.push({
-      isSmartMoney: false, // Would check against known winning wallets
-      isWhale: false, // Would check holder amounts
-      isKnownWinner: false,
-      walletAge: 0,
-      profitRate: 0,
-      recentWins: 0,
+      isSmartMoney,
+      isWhale,
+      isKnownWinner: buyPressure > 2 && volume24h > 100000, // High buy pressure with volume
+      walletAge: 0, // Would need wallet-specific data
+      profitRate: buyPressure > 1.5 ? 0.6 : 0.4, // Estimate based on buy pressure
+      recentWins: buyPressure > 2 ? 3 : (buyPressure > 1.5 ? 1 : 0),
     });
 
     return signals;
@@ -119,30 +133,73 @@ export class TokenAnalyzer {
   }
 
   private analyzeFundamental(tokenData: TokenData, dexData: any, birdeyeData: any): FundamentalSignal {
-    const topHolderPercentage = 0; // Would get from Birdeye/Helius
-    const holderConcentration = topHolderPercentage / 100;
+    // Extract security data from Birdeye if available
+    const securityData = birdeyeData?.security || {};
 
+    // Top holder percentage from Birdeye or estimate from holder count
+    let topHolderPercentage = securityData.top10HolderPercent || 0;
+    if (!topHolderPercentage && tokenData.holders > 0) {
+      // Estimate: fewer holders = higher concentration
+      topHolderPercentage = tokenData.holders < 100 ? 80 :
+                           tokenData.holders < 500 ? 50 :
+                           tokenData.holders < 1000 ? 30 : 20;
+    }
+
+    const holderConcentration = topHolderPercentage / 100;
     const tokenAge = (Date.now() - tokenData.createdAt.getTime()) / (1000 * 60 * 60); // hours
+
+    // Check if liquidity is locked (from Birdeye or DexScreener)
+    const liquidityLocked = securityData.isLpBurned ||
+                           securityData.lpLocked ||
+                           dexData.info?.socials?.some((s: any) =>
+                             s.type === 'lplock' || s.url?.includes('lock')
+                           ) || false;
+
+    // Dev wallet checks
+    const devWalletLocked = securityData.ownershipRenounced ||
+                           securityData.mintDisabled ||
+                           securityData.freezeDisabled || false;
 
     return {
       holderConcentration,
       topHolderPercentage,
       uniqueHolders: tokenData.holders,
-      devWalletLocked: false, // Would check from security data
-      liquidityLocked: false, // Would check from security data
+      devWalletLocked,
+      liquidityLocked,
       tokenAge,
     };
   }
 
   private analyzeSocial(tokenData: TokenData, dexData: any): SocialSignal {
-    // This would integrate with Twitter API, Telegram, etc.
-    // For now, using DexScreener social metrics if available
+    // Use DexScreener social data if available
+    const socials = dexData.info?.socials || [];
+    const hasTwitter = socials.some((s: any) => s.type === 'twitter');
+    const hasTelegram = socials.some((s: any) => s.type === 'telegram');
+    const hasWebsite = socials.some((s: any) => s.type === 'website');
+
+    // Calculate social presence score
+    const socialPresence = (hasTwitter ? 1 : 0) + (hasTelegram ? 1 : 0) + (hasWebsite ? 1 : 0);
+
+    // Estimate trending score based on volume growth and social presence
+    const volumeGrowth = dexData.volume?.h1 && dexData.volume?.h6 ?
+      (parseFloat(dexData.volume.h1) / (parseFloat(dexData.volume.h6) / 6)) : 1;
+
+    const trendingScore = Math.min(1, (volumeGrowth - 1) * 0.5 + (socialPresence * 0.2));
+
+    // Determine sentiment from price action and buy/sell ratio
+    const priceChange = tokenData.priceChange24h;
+    const txns = dexData.txns?.h24 || { buys: 0, sells: 0 };
+    const buyRatio = txns.buys / Math.max(txns.sells, 1);
+
+    let sentiment: 'positive' | 'negative' | 'neutral' = 'neutral';
+    if (priceChange > 20 && buyRatio > 1.2) sentiment = 'positive';
+    else if (priceChange < -20 && buyRatio < 0.8) sentiment = 'negative';
 
     return {
-      twitterMentions: 0,
-      influencerEngagement: 0,
-      sentiment: 'neutral',
-      trendingScore: 0,
+      twitterMentions: hasTwitter ? 10 : 0, // Placeholder - would need Twitter API
+      influencerEngagement: socialPresence > 2 ? 5 : socialPresence,
+      sentiment,
+      trendingScore: Math.max(0, Math.min(1, trendingScore)),
     };
   }
 
