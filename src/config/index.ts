@@ -32,6 +32,35 @@ export const config = {
     minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '10000'),
     minVolume24hUsd: parseFloat(process.env.MIN_VOLUME_24H_USD || '50000'),
     mandatoryBuySignalIntervalMs: parseInt(process.env.MANDATORY_BUY_SIGNAL_INTERVAL_MS || '300000'), // 5 minutes
+
+    // Market cap filters (configurable low/high cap ranges)
+    marketCapFilters: {
+      // Low cap: $3k - $100k (high risk, high reward)
+      lowCap: {
+        enabled: process.env.LOW_CAP_ENABLED !== 'false',
+        minMarketCapUsd: parseFloat(process.env.LOW_CAP_MIN_MC_USD || '3000'),       // >= $3k
+        maxMarketCapUsd: parseFloat(process.env.LOW_CAP_MAX_MC_USD || '100000'),     // <= $100k
+        minLiquidityUsd: parseFloat(process.env.LOW_CAP_MIN_LIQ_USD || '3000'),
+        positionSizeMultiplier: parseFloat(process.env.LOW_CAP_POSITION_MULT || '0.5'), // Smaller positions
+      },
+      // Mid cap: $100k - $1M (moderate risk)
+      midCap: {
+        enabled: process.env.MID_CAP_ENABLED !== 'false',
+        minMarketCapUsd: parseFloat(process.env.MID_CAP_MIN_MC_USD || '100000'),     // >= $100k
+        maxMarketCapUsd: parseFloat(process.env.MID_CAP_MAX_MC_USD || '1000000'),    // <= $1M
+        minLiquidityUsd: parseFloat(process.env.MID_CAP_MIN_LIQ_USD || '10000'),
+        positionSizeMultiplier: parseFloat(process.env.MID_CAP_POSITION_MULT || '1.0'),
+      },
+      // High cap: $1M+ (lower risk, more stable)
+      highCap: {
+        enabled: process.env.HIGH_CAP_ENABLED !== 'false',
+        minMarketCapUsd: parseFloat(process.env.HIGH_CAP_MIN_MC_USD || '1000000'),   // >= $1M
+        maxMarketCapUsd: parseFloat(process.env.HIGH_CAP_MAX_MC_USD || '50000000'),  // <= $50M (configurable)
+        minLiquidityUsd: parseFloat(process.env.HIGH_CAP_MIN_LIQ_USD || '50000'),
+        positionSizeMultiplier: parseFloat(process.env.HIGH_CAP_POSITION_MULT || '1.5'), // Larger positions OK
+      },
+    },
+
     // New pairs scanning config (very fresh tokens)
     newPairs: {
       enabled: process.env.NEW_PAIRS_ENABLED !== 'false', // Enabled by default

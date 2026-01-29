@@ -1,7 +1,8 @@
 import { dexScreener, birdeye, helius, jupiter } from '../services/apiClients';
-import { TokenData, AnalysisResult, WalletSignal, TechnicalSignal, FundamentalSignal, SocialSignal, RunnerPattern } from '../types';
+import { TokenData, AnalysisResult, WalletSignal, TechnicalSignal, FundamentalSignal, SocialSignal, RunnerPattern, EnhancedTokenMetrics } from '../types';
 import { RUNNER_PATTERNS } from '../config';
 import { patternDiscovery } from '../learning/patternDiscovery';
+import { enhancedMetrics } from '../services/enhancedMetrics';
 import logger from '../utils/logger';
 import db from '../database';
 
@@ -168,20 +169,33 @@ export class TokenAnalyzer {
       const fundamental = this.analyzeFundamental(tokenData, dexData, birdeyeData, holderAnalysis);
       const social = this.analyzeSocial(tokenData, dexData);
 
+      // Fetch enhanced metrics (dev wallet behavior, buy/sell pressure, transaction velocity)
+      const enhancedMetricsData = await enhancedMetrics.getEnhancedMetrics(contractAddress, dexData);
+
+      // Log enhanced metrics for debugging
+      logger.debug(`Enhanced metrics for ${tokenData.symbol}:`, {
+        healthScore: enhancedMetricsData.overallHealthScore,
+        buyPressure: enhancedMetricsData.buySellPressure.pressure,
+        momentum: enhancedMetricsData.buySellPressure.momentum,
+        velocityScore: enhancedMetricsData.transactionVelocity.velocityScore,
+        riskFlags: enhancedMetricsData.riskFlags,
+        bullishSignals: enhancedMetricsData.bullishSignals,
+      });
+
       // Calculate overall score first (needed for pattern matching)
-      const preliminaryScore = this.calculateOverallScore(walletSignals, technical, fundamental, social, []);
+      const preliminaryScore = this.calculateOverallScore(walletSignals, technical, fundamental, social, [], enhancedMetricsData);
       const preliminaryConfidence = 0.5; // Base confidence before pattern matching
 
       // Match against patterns (including discovered patterns)
       const matchedPatterns = this.matchPatterns(walletSignals, technical, fundamental, social, tokenData, preliminaryScore, preliminaryConfidence);
 
       // Recalculate overall score with matched patterns
-      const overallScore = this.calculateOverallScore(walletSignals, technical, fundamental, social, matchedPatterns);
-      const confidence = this.calculateConfidence(matchedPatterns);
+      const overallScore = this.calculateOverallScore(walletSignals, technical, fundamental, social, matchedPatterns, enhancedMetricsData);
+      const confidence = this.calculateConfidence(matchedPatterns, enhancedMetricsData);
 
       // Generate recommendation
       const recommendation = this.generateRecommendation(overallScore, confidence);
-      const reasoning = this.generateReasoning(tokenData, matchedPatterns, overallScore);
+      const reasoning = this.generateReasoning(tokenData, matchedPatterns, overallScore, enhancedMetricsData);
 
       const result: AnalysisResult = {
         token: tokenData,
@@ -194,9 +208,10 @@ export class TokenAnalyzer {
         recommendation,
         matchedPatterns,
         reasoning,
+        enhancedMetrics: enhancedMetricsData,
       };
 
-      logger.info(`Analysis complete for ${tokenData.symbol}: Score ${overallScore.toFixed(2)}, Confidence ${confidence.toFixed(2)}`);
+      logger.info(`Analysis complete for ${tokenData.symbol}: Score ${overallScore.toFixed(2)}, Confidence ${confidence.toFixed(2)}, Health ${enhancedMetricsData.overallHealthScore}`);
 
       return { result };
     } catch (error) {
@@ -679,34 +694,68 @@ export class TokenAnalyzer {
     technical: TechnicalSignal,
     fundamental: FundamentalSignal,
     social: SocialSignal,
-    matchedPatterns: RunnerPattern[]
+    matchedPatterns: RunnerPattern[],
+    enhancedMetricsData?: EnhancedTokenMetrics
   ): number {
     let score = 0;
 
-    // Technical signals (40%)
-    if (technical.volumeBreakout) score += 15;
-    score += technical.liquidityScore * 15;
+    // Technical signals (35%)
+    if (technical.volumeBreakout) score += 12;
+    score += technical.liquidityScore * 13;
     if (technical.priceAction === 'bullish') score += 10;
 
-    // Fundamental signals (30%)
-    const holderScore = Math.min(fundamental.uniqueHolders / 1000, 1) * 15;
+    // Fundamental signals (25%)
+    const holderScore = Math.min(fundamental.uniqueHolders / 1000, 1) * 12;
     score += holderScore;
-    if (fundamental.liquidityLocked) score += 7.5;
-    if (fundamental.devWalletLocked) score += 7.5;
+    if (fundamental.liquidityLocked) score += 6.5;
+    if (fundamental.devWalletLocked) score += 6.5;
 
-    // Social signals (15%)
-    score += social.trendingScore * 15;
+    // Social signals (10%)
+    score += social.trendingScore * 10;
 
-    // Pattern matches (15%)
+    // Pattern matches (10%)
     if (matchedPatterns.length > 0) {
       const topPattern = matchedPatterns[0];
-      score += topPattern.confidence * 15;
+      score += topPattern.confidence * 10;
     }
 
-    return Math.min(100, score);
+    // Enhanced metrics (20%) - NEW
+    if (enhancedMetricsData) {
+      // Buy/sell pressure (8%)
+      const pressureBonus = {
+        'strong_buy': 8,
+        'buy': 5,
+        'neutral': 2,
+        'sell': -2,
+        'strong_sell': -5,
+      };
+      score += pressureBonus[enhancedMetricsData.buySellPressure.pressure] || 0;
+
+      // Transaction velocity (4%)
+      score += (enhancedMetricsData.transactionVelocity.velocityScore / 100) * 4;
+
+      // Dev wallet behavior (4%)
+      if (!enhancedMetricsData.devWallet.isDumping && !enhancedMetricsData.devWallet.suspiciousActivity) {
+        score += 4;
+      } else if (enhancedMetricsData.devWallet.isDumping) {
+        score -= 6; // Penalty for dumping
+      }
+
+      // Momentum bonus (2%)
+      if (enhancedMetricsData.buySellPressure.momentum === 'accelerating') {
+        score += 2;
+      } else if (enhancedMetricsData.buySellPressure.momentum === 'decelerating') {
+        score -= 1;
+      }
+
+      // Health score integration (2%)
+      score += (enhancedMetricsData.overallHealthScore / 100) * 2;
+    }
+
+    return Math.max(0, Math.min(100, score));
   }
 
-  private calculateConfidence(matchedPatterns: RunnerPattern[]): number {
+  private calculateConfidence(matchedPatterns: RunnerPattern[], enhancedMetricsData?: EnhancedTokenMetrics): number {
     if (matchedPatterns.length === 0) return 0.3;
 
     const topPattern = matchedPatterns[0];
@@ -720,7 +769,35 @@ export class TokenAnalyzer {
       confidence += learningBoost;
     }
 
-    return Math.min(0.95, confidence);
+    // Adjust confidence based on enhanced metrics
+    if (enhancedMetricsData) {
+      // Risk flags reduce confidence
+      const riskPenalty = Math.min(enhancedMetricsData.riskFlags.length * 0.05, 0.2);
+      confidence -= riskPenalty;
+
+      // Bullish signals increase confidence
+      const bullishBoost = Math.min(enhancedMetricsData.bullishSignals.length * 0.03, 0.15);
+      confidence += bullishBoost;
+
+      // Health score adjustment
+      if (enhancedMetricsData.overallHealthScore > 70) {
+        confidence += 0.1;
+      } else if (enhancedMetricsData.overallHealthScore < 30) {
+        confidence -= 0.15;
+      }
+
+      // Strong buy pressure boost
+      if (enhancedMetricsData.buySellPressure.pressure === 'strong_buy') {
+        confidence += 0.08;
+      }
+
+      // Dev dumping penalty
+      if (enhancedMetricsData.devWallet.isDumping) {
+        confidence -= 0.2;
+      }
+    }
+
+    return Math.max(0.1, Math.min(0.95, confidence));
   }
 
   private generateRecommendation(score: number, confidence: number): 'strong_buy' | 'buy' | 'hold' | 'avoid' {
@@ -730,13 +807,68 @@ export class TokenAnalyzer {
     return 'avoid';
   }
 
-  private generateReasoning(tokenData: TokenData, matchedPatterns: RunnerPattern[], score: number): string {
+  private generateReasoning(tokenData: TokenData, matchedPatterns: RunnerPattern[], score: number, enhancedMetricsData?: EnhancedTokenMetrics): string {
     let reasoning = `**${tokenData.symbol} Analysis**\n\n`;
 
     reasoning += `💰 Price: $${tokenData.price.toFixed(8)}\n`;
     reasoning += `📊 24h Change: ${tokenData.priceChange24h.toFixed(2)}%\n`;
     reasoning += `💧 Liquidity: $${tokenData.liquidity.toLocaleString()}\n`;
     reasoning += `📈 Volume 24h: $${tokenData.volume24h.toLocaleString()}\n\n`;
+
+    // Enhanced metrics section
+    if (enhancedMetricsData) {
+      reasoning += `⚡ **Trading Activity:**\n`;
+
+      // Buy/sell pressure
+      const pressureEmoji = {
+        'strong_buy': '🟢🟢',
+        'buy': '🟢',
+        'neutral': '⚪',
+        'sell': '🔴',
+        'strong_sell': '🔴🔴',
+      };
+      reasoning += `• Pressure: ${pressureEmoji[enhancedMetricsData.buySellPressure.pressure]} ${enhancedMetricsData.buySellPressure.pressure.replace('_', ' ').toUpperCase()}\n`;
+      reasoning += `• Buy/Sell Ratio: ${enhancedMetricsData.buySellPressure.buyToSellRatio.toFixed(2)}\n`;
+      reasoning += `• Momentum: ${enhancedMetricsData.buySellPressure.momentum}\n`;
+
+      // Transaction velocity
+      reasoning += `• Velocity: ${enhancedMetricsData.transactionVelocity.velocityScore.toFixed(0)}/100 `;
+      if (enhancedMetricsData.transactionVelocity.isSpike) reasoning += `⚡ SPIKE`;
+      reasoning += `\n`;
+      reasoning += `• 24h Transactions: ${enhancedMetricsData.transactionVelocity.txns24h.toLocaleString()}\n\n`;
+
+      // Dev wallet status
+      if (enhancedMetricsData.devWallet.devWalletAddress) {
+        reasoning += `👤 **Dev Wallet:**\n`;
+        reasoning += `• Holdings: ${enhancedMetricsData.devWallet.percentageOfSupply.toFixed(1)}%\n`;
+        if (enhancedMetricsData.devWallet.isDumping) {
+          reasoning += `• ⚠️ WARNING: Dev is dumping!\n`;
+        } else if (enhancedMetricsData.devWallet.sellPressure < 0.1) {
+          reasoning += `• ✅ Dev wallet stable\n`;
+        }
+        reasoning += `\n`;
+      }
+
+      // Risk flags
+      if (enhancedMetricsData.riskFlags.length > 0) {
+        reasoning += `⚠️ **Risk Flags:**\n`;
+        enhancedMetricsData.riskFlags.forEach(flag => {
+          reasoning += `• ${flag}\n`;
+        });
+        reasoning += `\n`;
+      }
+
+      // Bullish signals
+      if (enhancedMetricsData.bullishSignals.length > 0) {
+        reasoning += `✅ **Bullish Signals:**\n`;
+        enhancedMetricsData.bullishSignals.forEach(signal => {
+          reasoning += `• ${signal}\n`;
+        });
+        reasoning += `\n`;
+      }
+
+      reasoning += `🏥 Health Score: ${enhancedMetricsData.overallHealthScore}/100\n\n`;
+    }
 
     if (matchedPatterns.length > 0) {
       reasoning += `🎯 **Matched Patterns:**\n`;
