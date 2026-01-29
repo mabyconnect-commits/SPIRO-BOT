@@ -73,7 +73,7 @@ export interface RunnerPattern {
 export interface PatternSignal {
   type: 'wallet' | 'technical' | 'fundamental' | 'social';
   metric: string;
-  operator: 'gt' | 'lt' | 'eq' | 'gte' | 'lte';
+  operator: 'gt' | 'lt' | 'eq' | 'gte' | 'lte' | 'between';
   value: number;
   weight: number;
 }
@@ -161,4 +161,54 @@ export interface LearningData {
   returnPercentage: number;
   entrySignals: any;
   timestamp: Date;
+}
+
+// On-chain holder tracking types
+export interface HolderInfo {
+  address: string;
+  balance: number;
+  percentage: number;
+  isWhale: boolean;      // Holds > 2% of supply
+  isSmartMoney: boolean; // Known profitable wallet
+}
+
+export interface HolderDistribution {
+  totalHolders: number;
+  top10Percentage: number;
+  top20Percentage: number;
+  top50Percentage: number;
+  whaleCount: number;       // Wallets holding > 2%
+  retailCount: number;      // Wallets holding < 0.1%
+  concentration: 'high' | 'medium' | 'low'; // Based on top 10 %
+  topHolders: HolderInfo[];
+}
+
+export interface HolderSnapshot {
+  contractAddress: string;
+  timestamp: Date;
+  distribution: HolderDistribution;
+}
+
+export interface HolderChange {
+  address: string;
+  previousBalance: number;
+  newBalance: number;
+  changeAmount: number;
+  changePercent: number;
+  action: 'buy' | 'sell' | 'new' | 'exit';
+  isWhale: boolean;
+  timestamp: Date;
+}
+
+export interface HolderAnalysis {
+  distribution: HolderDistribution;
+  recentChanges: HolderChange[];
+  signals: {
+    whaleAccumulating: boolean;
+    smartMoneyEntering: boolean;
+    retailFomo: boolean;
+    distributionImproving: boolean;
+    dangerousConcentration: boolean;
+  };
+  score: number; // 0-100 holder health score
 }

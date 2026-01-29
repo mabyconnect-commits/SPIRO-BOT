@@ -10,6 +10,7 @@
 import { AnalysisResult, TradePosition, TokenData } from '../types';
 import { config, TRADING_PRESETS } from '../config';
 import { mlEngine, TradeRecord } from '../ml/mlStrategyEngine';
+import { jupiter } from '../services/apiClients';
 import db from '../database';
 import logger from '../utils/logger';
 import crypto from 'crypto';
@@ -51,6 +52,7 @@ export interface ActiveSimulation {
   status: 'active' | 'closed';
   exitReason?: string;
   analysisSnapshot: AnalysisResult;
+  marketCapTier?: MarketCapTier;
 }
 
 export interface SimulationResult {
@@ -71,7 +73,63 @@ export interface SimulationResult {
   is100x: boolean;
   exitReason: string;
   timestamp: number;
+  marketCapTier?: MarketCapTier;
 }
+
+// ============================================================
+// MARKET CONDITIONS
+// ============================================================
+
+export type MarketCapTier = 'micro' | 'low' | 'mid' | 'high';
+
+export interface MarketCondition {
+  tier: MarketCapTier;
+  marketCap: number;
+  liquidity: number;
+  volatilityLevel: 'low' | 'medium' | 'high';
+  volumeLevel: 'low' | 'medium' | 'high';
+}
+
+// Market cap thresholds (in USD)
+const MARKET_CAP_TIERS = {
+  micro: { min: 0, max: 50000 },        // < $50k - extremely risky, high reward potential
+  low: { min: 50000, max: 500000 },     // $50k - $500k - early stage, volatile
+  mid: { min: 500000, max: 5000000 },   // $500k - $5M - established but still volatile
+  high: { min: 5000000, max: Infinity }, // > $5M - more stable, lower multiples
+};
+
+// Strategy adjustments per market cap tier
+const TIER_ADJUSTMENTS: Record<MarketCapTier, {
+  stopLossMultiplier: number;
+  takeProfitMultiplier: number;
+  positionSizeMultiplier: number;
+  maxHoldMultiplier: number;
+}> = {
+  micro: {
+    stopLossMultiplier: 1.5,      // Wider stops for volatile micro caps
+    takeProfitMultiplier: 2.0,    // Higher targets possible
+    positionSizeMultiplier: 0.5,  // Smaller positions due to risk
+    maxHoldMultiplier: 0.5,       // Shorter holds - quick in/out
+  },
+  low: {
+    stopLossMultiplier: 1.2,
+    takeProfitMultiplier: 1.5,
+    positionSizeMultiplier: 0.7,
+    maxHoldMultiplier: 0.75,
+  },
+  mid: {
+    stopLossMultiplier: 1.0,      // Standard parameters
+    takeProfitMultiplier: 1.0,
+    positionSizeMultiplier: 1.0,
+    maxHoldMultiplier: 1.0,
+  },
+  high: {
+    stopLossMultiplier: 0.8,      // Tighter stops
+    takeProfitMultiplier: 0.7,    // Lower targets
+    positionSizeMultiplier: 1.3,  // Can take larger positions
+    maxHoldMultiplier: 1.5,       // Can hold longer
+  },
+};
 
 // ============================================================
 // BUILT-IN STRATEGIES
@@ -202,12 +260,36 @@ const SIMULATION_STRATEGIES: SimulationStrategy[] = [
 // SIMULATION ENGINE
 // ============================================================
 
+// Winner notification callback type
+export type WinnerCallback = (result: SimulationResult, multiplier: '5x' | '10x' | '100x') => void;
+
+// Leaderboard entry
+export interface LeaderboardEntry {
+  rank: number;
+  contractAddress: string;
+  symbol: string;
+  bestMultiple: number;
+  avgROI: number;
+  winCount: number;
+  totalTrades: number;
+  winRate: number;
+  lastWinTimestamp: number;
+}
+
 export class SimulationEngine {
   private activeSimulations: Map<string, ActiveSimulation> = new Map();
   private completedResults: SimulationResult[] = [];
   private strategies: SimulationStrategy[] = [...SIMULATION_STRATEGIES];
   private monitorInterval: NodeJS.Timeout | null = null;
   private virtualBalance: number = 1000; // 1000 SOL virtual balance for sims
+
+  // Winner notification callbacks
+  private winnerCallbacks: WinnerCallback[] = [];
+
+  // Leaderboard cache
+  private leaderboardCache: LeaderboardEntry[] = [];
+  private leaderboardCacheTime: number = 0;
+  private leaderboardCacheTTL: number = 60000; // 1 minute
 
   private stats = {
     totalSimulations: 0,
@@ -229,27 +311,360 @@ export class SimulationEngine {
   }
 
   // ============================================================
+  // WINNER NOTIFICATIONS
+  // ============================================================
+
+  /**
+   * Register a callback to be notified when a simulation hits a multiplier target
+   */
+  onWinner(callback: WinnerCallback): void {
+    this.winnerCallbacks.push(callback);
+  }
+
+  /**
+   * Remove a winner callback
+   */
+  removeWinnerCallback(callback: WinnerCallback): void {
+    const idx = this.winnerCallbacks.indexOf(callback);
+    if (idx !== -1) {
+      this.winnerCallbacks.splice(idx, 1);
+    }
+  }
+
+  /**
+   * Notify all registered callbacks about a winner
+   */
+  private notifyWinner(result: SimulationResult): void {
+    if (result.is100x) {
+      logger.info(`🚀🚀🚀 100X WINNER DETECTED: ${result.symbol} - ${result.profitMultiple.toFixed(0)}x return!`);
+      for (const callback of this.winnerCallbacks) {
+        try {
+          callback(result, '100x');
+        } catch (e) {
+          logger.error('Winner callback error:', e);
+        }
+      }
+    } else if (result.is10x) {
+      logger.info(`🚀🚀 10X WINNER: ${result.symbol} - ${result.profitMultiple.toFixed(0)}x return!`);
+      for (const callback of this.winnerCallbacks) {
+        try {
+          callback(result, '10x');
+        } catch (e) {
+          logger.error('Winner callback error:', e);
+        }
+      }
+    } else if (result.is5x) {
+      logger.info(`🚀 5X WINNER: ${result.symbol} - ${result.profitMultiple.toFixed(0)}x return!`);
+      for (const callback of this.winnerCallbacks) {
+        try {
+          callback(result, '5x');
+        } catch (e) {
+          logger.error('Winner callback error:', e);
+        }
+      }
+    }
+  }
+
+  // ============================================================
+  // LEADERBOARD
+  // ============================================================
+
+  /**
+   * Get the top performing tokens leaderboard
+   */
+  getLeaderboard(limit: number = 20): LeaderboardEntry[] {
+    const now = Date.now();
+
+    // Return cached if fresh
+    if (now - this.leaderboardCacheTime < this.leaderboardCacheTTL && this.leaderboardCache.length > 0) {
+      return this.leaderboardCache.slice(0, limit);
+    }
+
+    // Build leaderboard from completed results
+    const tokenStats = new Map<string, {
+      contractAddress: string;
+      symbol: string;
+      results: SimulationResult[];
+    }>();
+
+    for (const result of this.completedResults) {
+      const existing = tokenStats.get(result.contractAddress) || {
+        contractAddress: result.contractAddress,
+        symbol: result.symbol,
+        results: [],
+      };
+      existing.results.push(result);
+      tokenStats.set(result.contractAddress, existing);
+    }
+
+    // Calculate leaderboard entries
+    const entries: LeaderboardEntry[] = [];
+
+    for (const [address, data] of tokenStats) {
+      const results = data.results;
+      const wins = results.filter(r => r.outcome === 'win');
+      const bestMultiple = Math.max(...results.map(r => r.profitMultiple));
+      const avgROI = results.reduce((s, r) => s + r.roi, 0) / results.length;
+      const lastWin = wins.length > 0 ? Math.max(...wins.map(r => r.timestamp)) : 0;
+
+      entries.push({
+        rank: 0, // Will be set after sorting
+        contractAddress: address,
+        symbol: data.symbol,
+        bestMultiple,
+        avgROI,
+        winCount: wins.length,
+        totalTrades: results.length,
+        winRate: (wins.length / results.length) * 100,
+        lastWinTimestamp: lastWin,
+      });
+    }
+
+    // Sort by best multiple, then by avg ROI
+    entries.sort((a, b) => {
+      if (b.bestMultiple !== a.bestMultiple) return b.bestMultiple - a.bestMultiple;
+      return b.avgROI - a.avgROI;
+    });
+
+    // Assign ranks
+    entries.forEach((e, i) => e.rank = i + 1);
+
+    // Cache the results
+    this.leaderboardCache = entries;
+    this.leaderboardCacheTime = now;
+
+    return entries.slice(0, limit);
+  }
+
+  /**
+   * Get recent big winners (5x+)
+   */
+  getRecentBigWinners(hours: number = 24, minMultiple: number = 5): SimulationResult[] {
+    const cutoff = Date.now() - hours * 60 * 60 * 1000;
+    return this.completedResults
+      .filter(r => r.timestamp > cutoff && r.profitMultiple >= minMultiple)
+      .sort((a, b) => b.profitMultiple - a.profitMultiple);
+  }
+
+  /**
+   * Generate leaderboard report
+   */
+  generateLeaderboardReport(limit: number = 10): string {
+    const leaderboard = this.getLeaderboard(limit);
+
+    if (leaderboard.length === 0) {
+      return '🏆 *Leaderboard*\n\nNo completed simulations yet.';
+    }
+
+    let report = `🏆 *Top ${Math.min(limit, leaderboard.length)} Performing Tokens*\n\n`;
+
+    for (const entry of leaderboard) {
+      const medal = entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : `${entry.rank}.`;
+      const multiplierEmoji = entry.bestMultiple >= 100 ? '🚀🚀🚀' :
+                              entry.bestMultiple >= 10 ? '🚀🚀' :
+                              entry.bestMultiple >= 5 ? '🚀' : '';
+
+      report += `${medal} *${entry.symbol}* ${multiplierEmoji}\n`;
+      report += `   Best: ${entry.bestMultiple.toFixed(1)}x | Avg: ${entry.avgROI.toFixed(0)}%\n`;
+      report += `   W/L: ${entry.winCount}/${entry.totalTrades - entry.winCount} (${entry.winRate.toFixed(0)}%)\n\n`;
+    }
+
+    // Add recent big winners section
+    const recentWinners = this.getRecentBigWinners(24, 5);
+    if (recentWinners.length > 0) {
+      report += `\n🌟 *Recent Big Winners (24h)*\n`;
+      for (const w of recentWinners.slice(0, 5)) {
+        const emoji = w.is100x ? '💯' : w.is10x ? '🔥' : '✨';
+        const timeAgo = Math.round((Date.now() - w.timestamp) / 60000);
+        report += `${emoji} ${w.symbol}: ${w.profitMultiple.toFixed(1)}x (${timeAgo}m ago)\n`;
+      }
+    }
+
+    return report;
+  }
+
+  // ============================================================
+  // MARKET CONDITION DETECTION
+  // ============================================================
+
+  /**
+   * Detect market cap tier for a token
+   */
+  getMarketCapTier(marketCap: number): MarketCapTier {
+    if (marketCap < MARKET_CAP_TIERS.micro.max) return 'micro';
+    if (marketCap < MARKET_CAP_TIERS.low.max) return 'low';
+    if (marketCap < MARKET_CAP_TIERS.mid.max) return 'mid';
+    return 'high';
+  }
+
+  /**
+   * Analyze market conditions for a token
+   */
+  analyzeMarketCondition(analysis: AnalysisResult): MarketCondition {
+    const marketCap = analysis.token.marketCap;
+    const liquidity = analysis.token.liquidity;
+    const volume = analysis.token.volume24h;
+    const volatility = analysis.technical.volatility;
+
+    const tier = this.getMarketCapTier(marketCap);
+
+    // Determine volatility level
+    let volatilityLevel: 'low' | 'medium' | 'high' = 'medium';
+    if (volatility < 0.3) volatilityLevel = 'low';
+    else if (volatility > 0.6) volatilityLevel = 'high';
+
+    // Determine volume level relative to market cap
+    const volumeToMcRatio = marketCap > 0 ? volume / marketCap : 0;
+    let volumeLevel: 'low' | 'medium' | 'high' = 'medium';
+    if (volumeToMcRatio < 0.1) volumeLevel = 'low';
+    else if (volumeToMcRatio > 0.5) volumeLevel = 'high';
+
+    return {
+      tier,
+      marketCap,
+      liquidity,
+      volatilityLevel,
+      volumeLevel,
+    };
+  }
+
+  /**
+   * Adapt strategy parameters based on market conditions
+   */
+  adaptStrategyForMarket(
+    strategy: SimulationStrategy,
+    condition: MarketCondition
+  ): SimulationStrategy {
+    const adjustments = TIER_ADJUSTMENTS[condition.tier];
+
+    // Create adapted strategy with adjusted parameters
+    const adapted: SimulationStrategy = {
+      ...strategy,
+      id: `${strategy.id}_${condition.tier}`,
+      name: `${strategy.name} (${condition.tier.toUpperCase()})`,
+      positionSizePct: strategy.positionSizePct * adjustments.positionSizeMultiplier,
+      stopLossPct: strategy.stopLossPct * adjustments.stopLossMultiplier,
+      maxHoldMinutes: Math.round(strategy.maxHoldMinutes * adjustments.maxHoldMultiplier),
+      takeProfitTiers: strategy.takeProfitTiers.map(t =>
+        Math.round(t * adjustments.takeProfitMultiplier)
+      ),
+    };
+
+    // Adapt exit conditions for volatility
+    if (condition.volatilityLevel === 'high') {
+      // More aggressive trailing stops in high volatility
+      adapted.exitCondition = (sim) => {
+        const baseExit = strategy.exitCondition(sim);
+        if (baseExit.shouldExit) return baseExit;
+
+        // Tighter trailing stop in high volatility after profit
+        if (sim.roi > 30) {
+          const trailStop = sim.highestPrice * 0.6; // 40% trail
+          if (sim.currentPrice <= trailStop) {
+            return { shouldExit: true, reason: 'Volatility trailing stop' };
+          }
+        }
+        return { shouldExit: false, reason: '' };
+      };
+    }
+
+    return adapted;
+  }
+
+  /**
+   * Get strategy performance by market cap tier
+   */
+  getPerformanceByTier(): Record<MarketCapTier, {
+    trades: number;
+    winRate: number;
+    avgROI: number;
+    best5x: number;
+    best10x: number;
+  }> {
+    const performance: Record<MarketCapTier, {
+      trades: number;
+      wins: number;
+      totalROI: number;
+      fiveX: number;
+      tenX: number;
+    }> = {
+      micro: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+      low: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+      mid: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+      high: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+    };
+
+    for (const result of this.completedResults) {
+      const tier = result.marketCapTier || 'mid'; // Default to mid if not recorded
+      performance[tier].trades++;
+      if (result.outcome === 'win') performance[tier].wins++;
+      performance[tier].totalROI += result.roi;
+      if (result.is5x) performance[tier].fiveX++;
+      if (result.is10x) performance[tier].tenX++;
+    }
+
+    return {
+      micro: {
+        trades: performance.micro.trades,
+        winRate: performance.micro.trades > 0 ? (performance.micro.wins / performance.micro.trades) * 100 : 0,
+        avgROI: performance.micro.trades > 0 ? performance.micro.totalROI / performance.micro.trades : 0,
+        best5x: performance.micro.fiveX,
+        best10x: performance.micro.tenX,
+      },
+      low: {
+        trades: performance.low.trades,
+        winRate: performance.low.trades > 0 ? (performance.low.wins / performance.low.trades) * 100 : 0,
+        avgROI: performance.low.trades > 0 ? performance.low.totalROI / performance.low.trades : 0,
+        best5x: performance.low.fiveX,
+        best10x: performance.low.tenX,
+      },
+      mid: {
+        trades: performance.mid.trades,
+        winRate: performance.mid.trades > 0 ? (performance.mid.wins / performance.mid.trades) * 100 : 0,
+        avgROI: performance.mid.trades > 0 ? performance.mid.totalROI / performance.mid.trades : 0,
+        best5x: performance.mid.fiveX,
+        best10x: performance.mid.tenX,
+      },
+      high: {
+        trades: performance.high.trades,
+        winRate: performance.high.trades > 0 ? (performance.high.wins / performance.high.trades) * 100 : 0,
+        avgROI: performance.high.trades > 0 ? performance.high.totalROI / performance.high.trades : 0,
+        best5x: performance.high.fiveX,
+        best10x: performance.high.tenX,
+      },
+    };
+  }
+
+  // ============================================================
   // CORE: Simulate token with all strategies
   // ============================================================
 
   /**
    * Run all applicable strategies on a discovered token
+   * Now with market-adaptive strategy parameters
    */
   async simulateToken(analysis: AnalysisResult): Promise<ActiveSimulation[]> {
     const created: ActiveSimulation[] = [];
 
+    // Analyze market conditions for this token
+    const marketCondition = this.analyzeMarketCondition(analysis);
+
     for (const strategy of this.strategies) {
       try {
         if (strategy.entryCondition(analysis)) {
-          const sim = this.createSimulation(strategy, analysis);
+          // Adapt strategy parameters based on market conditions
+          const adaptedStrategy = this.adaptStrategyForMarket(strategy, marketCondition);
+
+          const sim = this.createSimulation(adaptedStrategy, analysis, marketCondition.tier);
           this.activeSimulations.set(sim.id, sim);
           created.push(sim);
           this.stats.totalSimulations++;
           this.stats.activeSimulations++;
 
           logger.info(
-            `🧪 SIM [${strategy.name}] ${analysis.token.symbol}: ` +
-            `entry $${analysis.token.price.toFixed(8)} | ${strategy.positionSizePct}% size`
+            `🧪 SIM [${adaptedStrategy.name}] ${analysis.token.symbol}: ` +
+            `entry $${analysis.token.price.toFixed(8)} | ${adaptedStrategy.positionSizePct.toFixed(1)}% size | ` +
+            `MC: $${(marketCondition.marketCap / 1000).toFixed(0)}k (${marketCondition.tier})`
           );
         }
       } catch (error) {
@@ -325,7 +740,11 @@ export class SimulationEngine {
   // SIMULATION MANAGEMENT
   // ============================================================
 
-  private createSimulation(strategy: SimulationStrategy, analysis: AnalysisResult): ActiveSimulation {
+  private createSimulation(
+    strategy: SimulationStrategy,
+    analysis: AnalysisResult,
+    marketCapTier?: MarketCapTier
+  ): ActiveSimulation {
     const solAmount = this.virtualBalance * (strategy.positionSizePct / 100);
 
     return {
@@ -347,6 +766,7 @@ export class SimulationEngine {
       partialExitsDone: 0,
       status: 'active',
       analysisSnapshot: analysis,
+      marketCapTier,
     };
   }
 
@@ -406,6 +826,7 @@ export class SimulationEngine {
       is100x,
       exitReason: reason,
       timestamp: Date.now(),
+      marketCapTier: sim.marketCapTier,
     };
 
     // Update stats
@@ -439,6 +860,11 @@ export class SimulationEngine {
       `${sim.roi.toFixed(1)}% ROI (${sim.profitMultiple.toFixed(1)}x) | ` +
       `${timeHeldMinutes.toFixed(0)}m | ${reason}`
     );
+
+    // Notify winner callbacks
+    if (is5x || is10x || is100x) {
+      this.notifyWinner(result);
+    }
 
     return result;
   }
@@ -496,17 +922,88 @@ export class SimulationEngine {
 
   startMonitoring(intervalMs: number = 60000): void {
     if (this.monitorInterval) return;
-    this.monitorInterval = setInterval(() => {
+    this.monitorInterval = setInterval(async () => {
+      // Update all active simulations with real prices
+      await this.updateAllSimulationPrices();
+      // Then close any expired ones
       this.closeExpiredSimulations();
     }, intervalMs);
-    logger.info('Simulation monitoring started');
+    logger.info(`Simulation monitoring started (updating every ${intervalMs / 1000}s)`);
   }
 
   stopMonitoring(): void {
     if (this.monitorInterval) {
       clearInterval(this.monitorInterval);
       this.monitorInterval = null;
+      logger.info('Simulation monitoring stopped');
     }
+  }
+
+  /**
+   * Update all active simulations with real-time prices from Jupiter
+   */
+  private async updateAllSimulationPrices(): Promise<void> {
+    const activeSims = this.getActiveSimulations();
+    if (activeSims.length === 0) return;
+
+    // Get unique contract addresses
+    const uniqueAddresses = [...new Set(activeSims.map(s => s.contractAddress))];
+    logger.debug(`Updating prices for ${uniqueAddresses.length} tokens in ${activeSims.length} active simulations`);
+
+    let updatedCount = 0;
+    let closedCount = 0;
+
+    for (const address of uniqueAddresses) {
+      try {
+        const currentPrice = await jupiter.getTokenPrice(address);
+
+        if (currentPrice !== null && currentPrice > 0) {
+          const closed = await this.updateSimulations(address, currentPrice);
+          updatedCount++;
+          closedCount += closed.length;
+
+          // Log significant price movements
+          const simsForToken = activeSims.filter(s => s.contractAddress === address);
+          for (const sim of simsForToken) {
+            const priceChange = ((currentPrice - sim.entryPrice) / sim.entryPrice) * 100;
+            if (Math.abs(priceChange) > 50) {
+              logger.info(`📊 ${sim.symbol} simulation: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% (${sim.strategyId})`);
+            }
+          }
+        }
+
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        logger.debug(`Failed to update price for ${address}:`, error);
+      }
+    }
+
+    if (updatedCount > 0 || closedCount > 0) {
+      logger.debug(`Simulation update: ${updatedCount} tokens updated, ${closedCount} positions closed`);
+    }
+  }
+
+  /**
+   * Get simulation performance by token for pattern analysis
+   */
+  getPerformanceByToken(): Map<string, { wins: number; losses: number; avgROI: number; best: number }> {
+    const performance = new Map<string, { wins: number; losses: number; avgROI: number; best: number }>();
+
+    for (const result of this.completedResults) {
+      const existing = performance.get(result.contractAddress) || { wins: 0, losses: 0, avgROI: 0, best: 0 };
+
+      if (result.outcome === 'win') existing.wins++;
+      else existing.losses++;
+
+      const total = existing.wins + existing.losses;
+      existing.avgROI = ((existing.avgROI * (total - 1)) + result.roi) / total;
+      existing.best = Math.max(existing.best, result.roi);
+
+      performance.set(result.contractAddress, existing);
+    }
+
+    return performance;
   }
 
   // ============================================================
