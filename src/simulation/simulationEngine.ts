@@ -10,6 +10,7 @@
 import { AnalysisResult, TradePosition, TokenData } from '../types';
 import { config, TRADING_PRESETS } from '../config';
 import { mlEngine, TradeRecord } from '../ml/mlStrategyEngine';
+import { jupiter } from '../services/apiClients';
 import db from '../database';
 import logger from '../utils/logger';
 import crypto from 'crypto';
@@ -496,17 +497,88 @@ export class SimulationEngine {
 
   startMonitoring(intervalMs: number = 60000): void {
     if (this.monitorInterval) return;
-    this.monitorInterval = setInterval(() => {
+    this.monitorInterval = setInterval(async () => {
+      // Update all active simulations with real prices
+      await this.updateAllSimulationPrices();
+      // Then close any expired ones
       this.closeExpiredSimulations();
     }, intervalMs);
-    logger.info('Simulation monitoring started');
+    logger.info(`Simulation monitoring started (updating every ${intervalMs / 1000}s)`);
   }
 
   stopMonitoring(): void {
     if (this.monitorInterval) {
       clearInterval(this.monitorInterval);
       this.monitorInterval = null;
+      logger.info('Simulation monitoring stopped');
     }
+  }
+
+  /**
+   * Update all active simulations with real-time prices from Jupiter
+   */
+  private async updateAllSimulationPrices(): Promise<void> {
+    const activeSims = this.getActiveSimulations();
+    if (activeSims.length === 0) return;
+
+    // Get unique contract addresses
+    const uniqueAddresses = [...new Set(activeSims.map(s => s.contractAddress))];
+    logger.debug(`Updating prices for ${uniqueAddresses.length} tokens in ${activeSims.length} active simulations`);
+
+    let updatedCount = 0;
+    let closedCount = 0;
+
+    for (const address of uniqueAddresses) {
+      try {
+        const currentPrice = await jupiter.getTokenPrice(address);
+
+        if (currentPrice !== null && currentPrice > 0) {
+          const closed = await this.updateSimulations(address, currentPrice);
+          updatedCount++;
+          closedCount += closed.length;
+
+          // Log significant price movements
+          const simsForToken = activeSims.filter(s => s.contractAddress === address);
+          for (const sim of simsForToken) {
+            const priceChange = ((currentPrice - sim.entryPrice) / sim.entryPrice) * 100;
+            if (Math.abs(priceChange) > 50) {
+              logger.info(`📊 ${sim.symbol} simulation: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% (${sim.strategyId})`);
+            }
+          }
+        }
+
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        logger.debug(`Failed to update price for ${address}:`, error);
+      }
+    }
+
+    if (updatedCount > 0 || closedCount > 0) {
+      logger.debug(`Simulation update: ${updatedCount} tokens updated, ${closedCount} positions closed`);
+    }
+  }
+
+  /**
+   * Get simulation performance by token for pattern analysis
+   */
+  getPerformanceByToken(): Map<string, { wins: number; losses: number; avgROI: number; best: number }> {
+    const performance = new Map<string, { wins: number; losses: number; avgROI: number; best: number }>();
+
+    for (const result of this.completedResults) {
+      const existing = performance.get(result.contractAddress) || { wins: 0, losses: 0, avgROI: 0, best: 0 };
+
+      if (result.outcome === 'win') existing.wins++;
+      else existing.losses++;
+
+      const total = existing.wins + existing.losses;
+      existing.avgROI = ((existing.avgROI * (total - 1)) + result.roi) / total;
+      existing.best = Math.max(existing.best, result.roi);
+
+      performance.set(result.contractAddress, existing);
+    }
+
+    return performance;
   }
 
   // ============================================================

@@ -214,7 +214,12 @@ export class BirdeyeClient {
 
 export class HeliusClient {
   private baseUrl = 'https://api.helius.xyz/v0';
+  private rpcUrl = 'https://mainnet.helius-rpc.com';
   private apiKey = config.apis.helius;
+
+  // Cache for holder snapshots (for change detection)
+  private holderSnapshots: Map<string, { holders: any[]; timestamp: number }> = new Map();
+  private snapshotTTL = 5 * 60 * 1000; // 5 minutes
 
   async getAsset(mintAddress: string): Promise<any> {
     if (!this.apiKey) {
@@ -253,6 +258,286 @@ export class HeliusClient {
       );
       return response.data.total || 0;
     }, `Helius.getTokenHolders(${mintAddress.substring(0, 8)}...)`);
+  }
+
+  /**
+   * Get detailed holder distribution for a token
+   */
+  async getHolderDistribution(mintAddress: string, limit: number = 50): Promise<{
+    totalHolders: number;
+    topHolders: Array<{ address: string; balance: number; percentage: number }>;
+  } | null> {
+    if (!this.apiKey) {
+      logger.debug('Helius API key not configured, skipping holder distribution');
+      return null;
+    }
+
+    return withRetry(async () => {
+      // Use Helius DAS API for token accounts
+      const response = await axios.post(
+        `${this.rpcUrl}/?api-key=${this.apiKey}`,
+        {
+          jsonrpc: '2.0',
+          id: 'holder-distribution',
+          method: 'getTokenAccounts',
+          params: {
+            mint: mintAddress,
+            limit: limit,
+            options: {
+              showZeroBalance: false,
+            }
+          }
+        },
+        { timeout: API_TIMEOUT }
+      );
+
+      const accounts = response.data.result?.token_accounts || [];
+
+      // Calculate total supply from holders (approximate)
+      let totalBalance = 0;
+      for (const account of accounts) {
+        totalBalance += parseFloat(account.amount) || 0;
+      }
+
+      // Map to holder info with percentages
+      const topHolders = accounts.map((account: any) => {
+        const balance = parseFloat(account.amount) || 0;
+        return {
+          address: account.owner,
+          balance,
+          percentage: totalBalance > 0 ? (balance / totalBalance) * 100 : 0,
+        };
+      }).sort((a: any, b: any) => b.balance - a.balance);
+
+      // Get total holder count
+      const holderCount = await this.getTokenHolders(mintAddress);
+
+      return {
+        totalHolders: holderCount || topHolders.length,
+        topHolders,
+      };
+    }, `Helius.getHolderDistribution(${mintAddress.substring(0, 8)}...)`);
+  }
+
+  /**
+   * Analyze holder distribution and return signals
+   */
+  async analyzeHolders(mintAddress: string): Promise<{
+    distribution: {
+      totalHolders: number;
+      top10Percentage: number;
+      top20Percentage: number;
+      whaleCount: number;
+      concentration: 'high' | 'medium' | 'low';
+    };
+    signals: {
+      dangerousConcentration: boolean;
+      healthyDistribution: boolean;
+      whalePresence: boolean;
+    };
+    score: number;
+  } | null> {
+    const holderData = await this.getHolderDistribution(mintAddress, 50);
+
+    if (!holderData) {
+      return null;
+    }
+
+    const { totalHolders, topHolders } = holderData;
+
+    // Calculate concentration metrics
+    const top10 = topHolders.slice(0, 10);
+    const top20 = topHolders.slice(0, 20);
+
+    const top10Percentage = top10.reduce((sum, h) => sum + h.percentage, 0);
+    const top20Percentage = top20.reduce((sum, h) => sum + h.percentage, 0);
+
+    // Count whales (holding > 2% of supply)
+    const whaleCount = topHolders.filter(h => h.percentage > 2).length;
+
+    // Determine concentration level
+    let concentration: 'high' | 'medium' | 'low' = 'medium';
+    if (top10Percentage > 70) concentration = 'high';
+    else if (top10Percentage < 40) concentration = 'low';
+
+    // Generate signals
+    const signals = {
+      dangerousConcentration: top10Percentage > 80 || (topHolders[0]?.percentage || 0) > 30,
+      healthyDistribution: top10Percentage < 50 && totalHolders > 100,
+      whalePresence: whaleCount >= 3,
+    };
+
+    // Calculate holder health score (0-100)
+    let score = 50;
+
+    // Penalize high concentration
+    if (top10Percentage > 80) score -= 30;
+    else if (top10Percentage > 60) score -= 15;
+    else if (top10Percentage < 40) score += 15;
+
+    // Reward holder count
+    if (totalHolders > 500) score += 15;
+    else if (totalHolders > 200) score += 10;
+    else if (totalHolders < 50) score -= 15;
+
+    // Moderate whale presence is okay, too many is bad
+    if (whaleCount >= 1 && whaleCount <= 5) score += 5;
+    else if (whaleCount > 10) score -= 10;
+
+    // Penalize single wallet dominance
+    if ((topHolders[0]?.percentage || 0) > 20) score -= 20;
+
+    score = Math.max(0, Math.min(100, score));
+
+    return {
+      distribution: {
+        totalHolders,
+        top10Percentage,
+        top20Percentage,
+        whaleCount,
+        concentration,
+      },
+      signals,
+      score,
+    };
+  }
+
+  /**
+   * Detect holder changes between snapshots
+   */
+  async detectHolderChanges(mintAddress: string): Promise<{
+    newWhales: string[];
+    exitedWhales: string[];
+    accumulatingAddresses: Array<{ address: string; changePercent: number }>;
+    distributingAddresses: Array<{ address: string; changePercent: number }>;
+    overallTrend: 'accumulation' | 'distribution' | 'neutral';
+  } | null> {
+    const currentData = await this.getHolderDistribution(mintAddress, 50);
+
+    if (!currentData) {
+      return null;
+    }
+
+    const cacheKey = mintAddress;
+    const previousSnapshot = this.holderSnapshots.get(cacheKey);
+    const now = Date.now();
+
+    // Create current snapshot
+    const currentSnapshot = {
+      holders: currentData.topHolders,
+      timestamp: now,
+    };
+
+    // Update cache
+    this.holderSnapshots.set(cacheKey, currentSnapshot);
+
+    // If no previous data, can't detect changes
+    if (!previousSnapshot || (now - previousSnapshot.timestamp) > this.snapshotTTL * 10) {
+      return {
+        newWhales: [],
+        exitedWhales: [],
+        accumulatingAddresses: [],
+        distributingAddresses: [],
+        overallTrend: 'neutral',
+      };
+    }
+
+    const previousMap = new Map(previousSnapshot.holders.map(h => [h.address, h]));
+    const currentMap = new Map(currentData.topHolders.map(h => [h.address, h]));
+
+    const newWhales: string[] = [];
+    const exitedWhales: string[] = [];
+    const accumulatingAddresses: Array<{ address: string; changePercent: number }> = [];
+    const distributingAddresses: Array<{ address: string; changePercent: number }> = [];
+
+    // Check current holders for changes
+    for (const [address, current] of currentMap) {
+      const previous = previousMap.get(address);
+
+      if (!previous) {
+        // New holder in top list
+        if (current.percentage > 2) {
+          newWhales.push(address);
+        }
+      } else {
+        // Existing holder - check for accumulation/distribution
+        const changePercent = previous.percentage > 0
+          ? ((current.percentage - previous.percentage) / previous.percentage) * 100
+          : 100;
+
+        if (changePercent > 10) {
+          accumulatingAddresses.push({ address, changePercent });
+        } else if (changePercent < -10) {
+          distributingAddresses.push({ address, changePercent });
+        }
+      }
+    }
+
+    // Check for exited whales
+    for (const [address, previous] of previousMap) {
+      if (previous.percentage > 2 && !currentMap.has(address)) {
+        exitedWhales.push(address);
+      }
+    }
+
+    // Determine overall trend
+    let overallTrend: 'accumulation' | 'distribution' | 'neutral' = 'neutral';
+    const accumulationScore = accumulatingAddresses.length + newWhales.length;
+    const distributionScore = distributingAddresses.length + exitedWhales.length;
+
+    if (accumulationScore > distributionScore + 2) {
+      overallTrend = 'accumulation';
+    } else if (distributionScore > accumulationScore + 2) {
+      overallTrend = 'distribution';
+    }
+
+    return {
+      newWhales,
+      exitedWhales,
+      accumulatingAddresses,
+      distributingAddresses,
+      overallTrend,
+    };
+  }
+
+  /**
+   * Get recent transactions for a token (for tracking whale movements)
+   */
+  async getRecentTokenTransactions(mintAddress: string, limit: number = 20): Promise<Array<{
+    signature: string;
+    timestamp: number;
+    from: string;
+    to: string;
+    amount: number;
+    type: 'transfer' | 'swap' | 'other';
+  }> | null> {
+    if (!this.apiKey) {
+      return null;
+    }
+
+    return withRetry(async () => {
+      const response = await axios.get(
+        `${this.baseUrl}/addresses/${mintAddress}/transactions`,
+        {
+          params: {
+            'api-key': this.apiKey,
+            limit: limit,
+          },
+          timeout: API_TIMEOUT,
+        }
+      );
+
+      const transactions = response.data || [];
+
+      return transactions.map((tx: any) => ({
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        from: tx.feePayer || tx.source || '',
+        to: tx.destination || '',
+        amount: tx.tokenTransfers?.[0]?.tokenAmount || 0,
+        type: tx.type === 'SWAP' ? 'swap' : tx.type === 'TRANSFER' ? 'transfer' : 'other',
+      }));
+    }, `Helius.getRecentTokenTransactions(${mintAddress.substring(0, 8)}...)`);
   }
 }
 

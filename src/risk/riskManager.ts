@@ -64,6 +64,7 @@ export class RiskManager {
   private dailyPnL: Map<number, { pnl: number; date: string }> = new Map();
   private userExposure: Map<number, number> = new Map();
   private lockedUsers: Map<number, { lockedAt: string; reason: string }> = new Map();
+  private tokenCategories: Map<string, string> = new Map(); // Token -> category mapping for correlation
 
   // Risk parameters
   private globalKillSwitch: boolean = false;
@@ -73,6 +74,8 @@ export class RiskManager {
   private minConfidenceForReal: number = 55;     // ML confidence threshold
   private maxDrawdownBeforeLock: number = 50;    // % daily drawdown to lock trading
   private honeypotScoreThreshold: number = 0.6;  // Above this = blocked
+  private maxCorrelatedExposure: number = 0.5;   // Max 50% exposure to correlated assets
+  private maxSingleTokenExposure: number = 0.25; // Max 25% in any single token
 
   constructor() {
     this.loadBlacklist();
@@ -167,6 +170,17 @@ export class RiskManager {
       }
     }
 
+    // 8.5 Portfolio correlation check
+    const correlationRisk = this.checkPortfolioCorrelation(analysis, userId, adjustedSize);
+    if (correlationRisk.overExposed) {
+      if (isReal) {
+        blockers.push(`Correlated exposure too high: ${correlationRisk.reason}`);
+        allowed = false;
+      } else {
+        warnings.push(`Correlated exposure warning: ${correlationRisk.reason}`);
+      }
+    }
+
     // 9. Daily loss limit check
     if (userProfile.dailyPnL < -userProfile.dailyLossLimitSol) {
       if (isReal) {
@@ -246,6 +260,153 @@ export class RiskManager {
 
     // Floor at 0.01 SOL, cap at base * 2
     return Math.max(0.01, Math.min(size, baseSize * 2));
+  }
+
+  // ============================================================
+  // PORTFOLIO CORRELATION
+  // ============================================================
+
+  /**
+   * Check if adding this position would over-expose user to correlated assets
+   */
+  private checkPortfolioCorrelation(
+    analysis: AnalysisResult,
+    userId: number,
+    positionSize: number
+  ): { overExposed: boolean; reason: string; correlatedExposure: number } {
+    const openPositions = db.getOpenPositions(userId);
+    if (openPositions.length === 0) {
+      return { overExposed: false, reason: '', correlatedExposure: 0 };
+    }
+
+    // Categorize the new token
+    const newCategory = this.categorizeToken(analysis);
+    this.tokenCategories.set(analysis.token.contractAddress, newCategory);
+
+    // Calculate total exposure and exposure by category
+    let totalExposure = positionSize;
+    const categoryExposure: Map<string, number> = new Map();
+    categoryExposure.set(newCategory, positionSize);
+
+    for (const position of openPositions) {
+      totalExposure += position.solInvested;
+
+      // Get or infer category
+      let category = this.tokenCategories.get(position.contractAddress);
+      if (!category) {
+        // Infer from symbol/name
+        category = this.inferCategory(position.symbol);
+        this.tokenCategories.set(position.contractAddress, category);
+      }
+
+      const existing = categoryExposure.get(category) || 0;
+      categoryExposure.set(category, existing + position.solInvested);
+    }
+
+    // Check if any category exceeds threshold
+    for (const [category, exposure] of categoryExposure) {
+      const ratio = exposure / totalExposure;
+      if (ratio > this.maxCorrelatedExposure) {
+        return {
+          overExposed: true,
+          reason: `${(ratio * 100).toFixed(0)}% in ${category} tokens (max ${this.maxCorrelatedExposure * 100}%)`,
+          correlatedExposure: ratio,
+        };
+      }
+    }
+
+    // Check single token exposure
+    const singleTokenRatio = positionSize / totalExposure;
+    if (singleTokenRatio > this.maxSingleTokenExposure) {
+      return {
+        overExposed: true,
+        reason: `${(singleTokenRatio * 100).toFixed(0)}% in single token (max ${this.maxSingleTokenExposure * 100}%)`,
+        correlatedExposure: singleTokenRatio,
+      };
+    }
+
+    return { overExposed: false, reason: '', correlatedExposure: 0 };
+  }
+
+  /**
+   * Categorize a token based on its characteristics
+   */
+  private categorizeToken(analysis: AnalysisResult): string {
+    const name = (analysis.token.name || '').toLowerCase();
+    const symbol = (analysis.token.symbol || '').toLowerCase();
+    const mc = analysis.token.marketCap;
+
+    // Check for common meme categories
+    if (name.includes('dog') || name.includes('shiba') || name.includes('inu') ||
+        symbol.includes('dog') || name.includes('puppy') || name.includes('woof')) {
+      return 'dog_meme';
+    }
+    if (name.includes('cat') || name.includes('kitty') || name.includes('meow') ||
+        symbol.includes('cat') || name.includes('feline')) {
+      return 'cat_meme';
+    }
+    if (name.includes('pepe') || name.includes('frog') || name.includes('kek')) {
+      return 'pepe_meme';
+    }
+    if (name.includes('ai') || name.includes('gpt') || name.includes('neural') ||
+        name.includes('bot') || name.includes('intelligence')) {
+      return 'ai_narrative';
+    }
+    if (name.includes('trump') || name.includes('biden') || name.includes('political') ||
+        name.includes('election') || name.includes('maga')) {
+      return 'political';
+    }
+    if (name.includes('elon') || name.includes('musk') || name.includes('doge') ||
+        name.includes('tesla')) {
+      return 'elon_meme';
+    }
+
+    // Categorize by market cap
+    if (mc < 50000) return 'micro_cap';
+    if (mc < 500000) return 'low_cap';
+    if (mc < 5000000) return 'mid_cap';
+    return 'high_cap';
+  }
+
+  /**
+   * Infer category from symbol/name when we don't have full analysis
+   */
+  private inferCategory(symbol: string): string {
+    const s = symbol.toLowerCase();
+    if (s.includes('dog') || s.includes('shib') || s.includes('inu')) return 'dog_meme';
+    if (s.includes('cat') || s.includes('kit')) return 'cat_meme';
+    if (s.includes('pepe') || s.includes('frog')) return 'pepe_meme';
+    if (s.includes('ai') || s.includes('gpt')) return 'ai_narrative';
+    return 'other';
+  }
+
+  /**
+   * Get portfolio diversification report
+   */
+  getPortfolioDiversification(userId: number): { category: string; exposure: number; percentage: number }[] {
+    const positions = db.getOpenPositions(userId);
+    if (positions.length === 0) return [];
+
+    const categoryExposure: Map<string, number> = new Map();
+    let totalExposure = 0;
+
+    for (const position of positions) {
+      totalExposure += position.solInvested;
+      let category = this.tokenCategories.get(position.contractAddress);
+      if (!category) {
+        category = this.inferCategory(position.symbol);
+        this.tokenCategories.set(position.contractAddress, category);
+      }
+      categoryExposure.set(category, (categoryExposure.get(category) || 0) + position.solInvested);
+    }
+
+    return Array.from(categoryExposure.entries())
+      .map(([category, exposure]) => ({
+        category,
+        exposure,
+        percentage: (exposure / totalExposure) * 100,
+      }))
+      .sort((a, b) => b.percentage - a.percentage);
   }
 
   // ============================================================

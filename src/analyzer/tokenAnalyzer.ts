@@ -139,8 +139,11 @@ export class TokenAnalyzer {
         };
       }
 
-      // Get holder count (optional - don't fail if unavailable)
-      const holderCount = await helius.getTokenHolders(contractAddress);
+      // Get holder analysis (optional - don't fail if unavailable)
+      const [holderCount, holderAnalysis] = await Promise.all([
+        helius.getTokenHolders(contractAddress),
+        helius.analyzeHolders(contractAddress).catch(() => null),
+      ]);
 
       // Build token data with safe parsing
       const tokenData: TokenData = {
@@ -159,9 +162,9 @@ export class TokenAnalyzer {
       };
 
       // Analyze different aspects
-      const walletSignals = await this.analyzeWallets(contractAddress, dexData);
+      const walletSignals = await this.analyzeWallets(contractAddress, dexData, holderAnalysis);
       const technical = this.analyzeTechnical(tokenData, dexData);
-      const fundamental = this.analyzeFundamental(tokenData, dexData, birdeyeData);
+      const fundamental = this.analyzeFundamental(tokenData, dexData, birdeyeData, holderAnalysis);
       const social = this.analyzeSocial(tokenData, dexData);
 
       // Match against patterns
@@ -204,7 +207,7 @@ export class TokenAnalyzer {
     }
   }
 
-  private async analyzeWallets(contractAddress: string, dexData: any): Promise<WalletSignal[]> {
+  private async analyzeWallets(contractAddress: string, dexData: any, holderAnalysis?: any): Promise<WalletSignal[]> {
     const signals: WalletSignal[] = [];
 
     // Analyze based on volume/liquidity patterns - high volume with good liquidity suggests smart money
@@ -213,14 +216,28 @@ export class TokenAnalyzer {
     const volumeToLiquidityRatio = liquidity > 0 ? volume24h / liquidity : 0;
 
     // High volume relative to liquidity can indicate smart money accumulation
-    const isSmartMoney = volumeToLiquidityRatio > 2 && volume24h > 50000;
+    // Also check holder analysis signals
+    let isSmartMoney = volumeToLiquidityRatio > 2 && volume24h > 50000;
+
+    // Enhanced smart money detection using holder analysis
+    if (holderAnalysis?.signals) {
+      // Healthy distribution with whale presence suggests smart money has positioned
+      if (holderAnalysis.signals.healthyDistribution && holderAnalysis.signals.whalePresence) {
+        isSmartMoney = true;
+      }
+    }
 
     // Whale detection based on large transactions (high volume in short time)
     const volume1h = safeParseFloat(dexData.volume?.h1, 0);
     const volume6h = safeParseFloat(dexData.volume?.h6, 0);
     // Safe division: average hourly volume over 6h, minimum 1 to avoid division by zero
     const avgHourlyVolume = Math.max(volume6h / 6, 1);
-    const isWhale = volume1h > 10000 && (volume1h / avgHourlyVolume) > 3;
+    let isWhale = volume1h > 10000 && (volume1h / avgHourlyVolume) > 3;
+
+    // Enhanced whale detection from holder analysis
+    if (holderAnalysis?.distribution?.whaleCount >= 2) {
+      isWhale = true;
+    }
 
     // Check transaction count patterns - ensure safe division
     const txns24h = dexData.txns?.h24 || { buys: 0, sells: 0 };
@@ -228,12 +245,28 @@ export class TokenAnalyzer {
     const sells = safeParseFloat(txns24h.sells, 0);
     const buyPressure = sells > 0 ? buys / sells : (buys > 0 ? 2 : 1); // If no sells, assume bullish if there are buys
 
+    // Estimate profit rate using holder analysis score if available
+    let profitRate = buyPressure > 1.5 ? 0.6 : 0.4;
+    if (holderAnalysis?.score) {
+      // High holder score suggests better positioned wallets
+      profitRate = Math.min(0.9, (holderAnalysis.score / 100) * 0.7 + 0.2);
+    }
+
+    // Check for known winner patterns
+    let isKnownWinner = buyPressure > 2 && volume24h > 100000;
+
+    // Dangerous concentration is a red flag - not a known winner pattern
+    if (holderAnalysis?.signals?.dangerousConcentration) {
+      isKnownWinner = false;
+      isSmartMoney = false;
+    }
+
     signals.push({
       isSmartMoney,
       isWhale,
-      isKnownWinner: buyPressure > 2 && volume24h > 100000, // High buy pressure with volume
+      isKnownWinner,
       walletAge: 0, // Would need wallet-specific data
-      profitRate: buyPressure > 1.5 ? 0.6 : 0.4, // Estimate based on buy pressure
+      profitRate,
       recentWins: buyPressure > 2 ? 3 : (buyPressure > 1.5 ? 1 : 0),
     });
 
@@ -276,13 +309,20 @@ export class TokenAnalyzer {
     };
   }
 
-  private analyzeFundamental(tokenData: TokenData, dexData: any, birdeyeData: any): FundamentalSignal {
+  private analyzeFundamental(tokenData: TokenData, dexData: any, birdeyeData: any, holderAnalysis?: any): FundamentalSignal {
     // Extract security data from Birdeye if available
     const securityData = birdeyeData?.security || birdeyeData || {};
 
-    // Top holder percentage from Birdeye or estimate from holder count
-    let topHolderPercentage = securityData.top10HolderPercent || 0;
-    if (!topHolderPercentage && tokenData.holders > 0) {
+    // Use on-chain holder analysis if available, otherwise fallback to estimates
+    let topHolderPercentage = 0;
+    let uniqueHolders = tokenData.holders;
+
+    if (holderAnalysis?.distribution) {
+      topHolderPercentage = holderAnalysis.distribution.top10Percentage || 0;
+      uniqueHolders = holderAnalysis.distribution.totalHolders || tokenData.holders;
+    } else if (securityData.top10HolderPercent) {
+      topHolderPercentage = securityData.top10HolderPercent;
+    } else if (tokenData.holders > 0) {
       // Estimate: fewer holders = higher concentration
       topHolderPercentage = tokenData.holders < 100 ? 80 :
                            tokenData.holders < 500 ? 50 :
@@ -301,7 +341,7 @@ export class TokenAnalyzer {
     return {
       holderConcentration,
       topHolderPercentage,
-      uniqueHolders: tokenData.holders,
+      uniqueHolders,
       devWalletLocked,
       liquidityLocked,
       tokenAge,
@@ -573,6 +613,14 @@ export class TokenAnalyzer {
       case 'lt': return value < signal.value;
       case 'lte': return value <= signal.value;
       case 'eq': return value === signal.value;
+      case 'between':
+        // 'between' uses value as [min, max] or checks against a range around the value
+        if (Array.isArray(signal.value)) {
+          return value >= signal.value[0] && value <= signal.value[1];
+        }
+        // Fallback: check if value is within 20% of signal.value
+        const range = signal.value * 0.2;
+        return value >= (signal.value - range) && value <= (signal.value + range);
       default: return false;
     }
   }
