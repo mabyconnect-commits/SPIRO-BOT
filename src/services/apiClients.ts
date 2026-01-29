@@ -591,3 +591,6 @@ export const dexScreener = new DexScreenerClient();
 export const birdeye = new BirdeyeClient();
 export const helius = new HeliusClient();
 export const jupiter = new JupiterClient();
+
+// Re-export enhanced metrics service for convenience
+export { enhancedMetrics } from './enhancedMetrics';

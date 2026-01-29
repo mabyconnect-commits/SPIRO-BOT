@@ -10,9 +10,52 @@ import crypto from 'crypto';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
+// ============================================================
+// TIERED TAKE PROFIT CONFIGURATION
+// ============================================================
+export interface TakeProfitTier {
+  multiplier: number;      // Price multiplier (e.g., 2 = 2x)
+  sellPercentage: number;  // Percentage of position to sell (e.g., 25 = 25%)
+  triggered: boolean;      // Has this tier been triggered
+}
+
+export interface TrailingStopConfig {
+  enabled: boolean;
+  activationMultiplier: number;  // Activate trailing stop at this multiplier (e.g., 1.5 = 50% gain)
+  trailingPercentage: number;    // Trail by this percentage (e.g., 20 = 20%)
+  highWaterMark: number;         // Highest price seen since activation
+  stopPrice: number;             // Current trailing stop price
+  isActive: boolean;             // Has trailing stop been activated
+}
+
+export interface AdvancedPositionConfig {
+  takeProfitTiers: TakeProfitTier[];
+  trailingStop: TrailingStopConfig;
+  remainingPercentage: number;   // Percentage of original position remaining
+}
+
+// Default tiered take profit strategy
+const DEFAULT_TAKE_PROFIT_TIERS: TakeProfitTier[] = [
+  { multiplier: 2, sellPercentage: 25, triggered: false },   // Sell 25% at 2x
+  { multiplier: 5, sellPercentage: 25, triggered: false },   // Sell 25% at 5x
+  { multiplier: 10, sellPercentage: 25, triggered: false },  // Sell 25% at 10x
+  // Remaining 25% held for potential 100x (or trailing stop)
+];
+
+// Default trailing stop config
+const DEFAULT_TRAILING_STOP: TrailingStopConfig = {
+  enabled: true,
+  activationMultiplier: 1.5,  // Activate after 50% gain
+  trailingPercentage: 25,     // 25% trailing stop
+  highWaterMark: 0,
+  stopPrice: 0,
+  isActive: false,
+};
+
 export class TradingEngine {
   private connection: Connection;
   private wallet: Keypair | null = null;
+  private advancedPositionConfigs: Map<string, AdvancedPositionConfig> = new Map();
 
   constructor() {
     this.connection = new Connection(config.solana.rpcUrl, 'confirmed');
@@ -26,6 +69,406 @@ export class TradingEngine {
         logger.error('Failed to initialize wallet:', error);
       }
     }
+
+    // Load advanced position configs from database
+    this.loadAdvancedConfigs();
+  }
+
+  /**
+   * Load advanced position configs from database
+   */
+  private loadAdvancedConfigs(): void {
+    try {
+      const configs = db.getAdvancedPositionConfigs();
+      for (const config of configs) {
+        this.advancedPositionConfigs.set(config.positionId, JSON.parse(config.config));
+      }
+      logger.debug(`Loaded ${this.advancedPositionConfigs.size} advanced position configs`);
+    } catch (error) {
+      logger.debug('Could not load advanced configs (table may not exist yet)');
+    }
+  }
+
+  /**
+   * Initialize advanced trading features for a position
+   */
+  initializeAdvancedTrading(
+    positionId: string,
+    entryPrice: number,
+    customTiers?: TakeProfitTier[],
+    customTrailingStop?: Partial<TrailingStopConfig>
+  ): AdvancedPositionConfig {
+    const config: AdvancedPositionConfig = {
+      takeProfitTiers: customTiers || JSON.parse(JSON.stringify(DEFAULT_TAKE_PROFIT_TIERS)),
+      trailingStop: {
+        ...DEFAULT_TRAILING_STOP,
+        ...customTrailingStop,
+        highWaterMark: entryPrice,
+        stopPrice: entryPrice * (1 - DEFAULT_TRAILING_STOP.trailingPercentage / 100),
+      },
+      remainingPercentage: 100,
+    };
+
+    this.advancedPositionConfigs.set(positionId, config);
+    this.saveAdvancedConfig(positionId, config);
+
+    logger.info(`📊 Advanced trading initialized for position ${positionId}`);
+    logger.info(`   Take profit tiers: ${config.takeProfitTiers.map(t => `${t.multiplier}x (${t.sellPercentage}%)`).join(', ')}`);
+    logger.info(`   Trailing stop: ${config.trailingStop.enabled ? `${config.trailingStop.trailingPercentage}% after ${config.trailingStop.activationMultiplier}x` : 'Disabled'}`);
+
+    return config;
+  }
+
+  /**
+   * Save advanced config to database
+   */
+  private saveAdvancedConfig(positionId: string, config: AdvancedPositionConfig): void {
+    try {
+      db.saveAdvancedPositionConfig(positionId, JSON.stringify(config));
+    } catch (error) {
+      logger.debug('Could not save advanced config (table may not exist)');
+    }
+  }
+
+  /**
+   * Process tiered take profit and trailing stop for a position
+   * Returns list of actions taken (partial sells, trailing stop triggers)
+   */
+  async processAdvancedOrders(
+    position: TradePosition,
+    userId: number = 0
+  ): Promise<{ action: string; amount: number; price: number }[]> {
+    const actions: { action: string; amount: number; price: number }[] = [];
+    const config = this.advancedPositionConfigs.get(position.id);
+
+    if (!config) {
+      return actions;
+    }
+
+    const currentMultiplier = position.currentPrice / position.entryPrice;
+
+    // Process tiered take profits
+    for (const tier of config.takeProfitTiers) {
+      if (!tier.triggered && currentMultiplier >= tier.multiplier) {
+        const sellAmount = (tier.sellPercentage / 100) * position.amount * (config.remainingPercentage / 100);
+
+        if (sellAmount > 0) {
+          // Execute partial sell
+          const success = await this.executePartialSell(position, sellAmount, userId);
+
+          if (success) {
+            tier.triggered = true;
+            config.remainingPercentage -= tier.sellPercentage;
+
+            actions.push({
+              action: `take_profit_${tier.multiplier}x`,
+              amount: sellAmount,
+              price: position.currentPrice,
+            });
+
+            logger.info(
+              `🎯 TIERED TP: ${position.symbol} hit ${tier.multiplier}x! ` +
+              `Sold ${tier.sellPercentage}% (${sellAmount.toFixed(4)} tokens) @ $${position.currentPrice.toFixed(8)}`
+            );
+          }
+        }
+      }
+    }
+
+    // Process trailing stop
+    if (config.trailingStop.enabled) {
+      const result = this.processTrailingStop(position, config, currentMultiplier);
+
+      if (result.updated) {
+        logger.info(
+          `📈 Trailing stop updated for ${position.symbol}: ` +
+          `High: $${config.trailingStop.highWaterMark.toFixed(8)}, Stop: $${config.trailingStop.stopPrice.toFixed(8)}`
+        );
+      }
+
+      if (result.triggered) {
+        // Execute trailing stop (sell remaining position)
+        const remainingAmount = position.amount * (config.remainingPercentage / 100);
+        const success = await this.executePartialSell(position, remainingAmount, userId);
+
+        if (success) {
+          actions.push({
+            action: 'trailing_stop',
+            amount: remainingAmount,
+            price: position.currentPrice,
+          });
+
+          logger.info(
+            `🛑 TRAILING STOP: ${position.symbol} triggered @ $${position.currentPrice.toFixed(8)} ` +
+            `(Stop was $${config.trailingStop.stopPrice.toFixed(8)})`
+          );
+        }
+      }
+    }
+
+    // Save updated config
+    this.saveAdvancedConfig(position.id, config);
+
+    return actions;
+  }
+
+  /**
+   * Process trailing stop logic
+   */
+  private processTrailingStop(
+    position: TradePosition,
+    config: AdvancedPositionConfig,
+    currentMultiplier: number
+  ): { updated: boolean; triggered: boolean } {
+    const result = { updated: false, triggered: false };
+    const trailingStop = config.trailingStop;
+
+    // Activate trailing stop if not active and multiplier threshold met
+    if (!trailingStop.isActive && currentMultiplier >= trailingStop.activationMultiplier) {
+      trailingStop.isActive = true;
+      trailingStop.highWaterMark = position.currentPrice;
+      trailingStop.stopPrice = position.currentPrice * (1 - trailingStop.trailingPercentage / 100);
+      result.updated = true;
+
+      logger.info(
+        `🔔 Trailing stop ACTIVATED for ${position.symbol} at ${currentMultiplier.toFixed(2)}x ` +
+        `(threshold: ${trailingStop.activationMultiplier}x)`
+      );
+    }
+
+    // Update high water mark and stop price if trailing stop is active
+    if (trailingStop.isActive) {
+      if (position.currentPrice > trailingStop.highWaterMark) {
+        trailingStop.highWaterMark = position.currentPrice;
+        trailingStop.stopPrice = position.currentPrice * (1 - trailingStop.trailingPercentage / 100);
+        result.updated = true;
+      }
+
+      // Check if trailing stop triggered
+      if (position.currentPrice <= trailingStop.stopPrice) {
+        result.triggered = true;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Execute partial sell (for tiered TP or trailing stop)
+   */
+  async executePartialSell(
+    position: TradePosition,
+    sellAmount: number,
+    userId: number = 0
+  ): Promise<boolean> {
+    try {
+      const isPaperTrade = position.type === 'paper';
+
+      if (isPaperTrade) {
+        return this.executePaperPartialSell(position, sellAmount, userId);
+      } else {
+        return this.executeRealPartialSell(position, sellAmount, userId);
+      }
+    } catch (error) {
+      logger.error('Partial sell error:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Execute paper partial sell
+   */
+  private async executePaperPartialSell(
+    position: TradePosition,
+    sellAmount: number,
+    userId: number
+  ): Promise<boolean> {
+    // Calculate value of sold tokens
+    const soldValue = sellAmount * position.currentPrice;
+
+    // Get current balance and add sold value
+    const currentBalance = db.getPaperBalance(userId);
+    const newBalance = currentBalance + soldValue;
+    db.updatePaperBalance(userId, newBalance);
+
+    // Update position amount
+    position.amount -= sellAmount;
+
+    // Calculate proportional SOL invested reduction
+    const sellPercentage = sellAmount / (position.amount + sellAmount);
+    const solReturned = position.solInvested * sellPercentage;
+    position.solInvested -= solReturned;
+
+    // Save updated position
+    db.savePosition(position);
+
+    // Record in history
+    db.recordPaperTradeHistory({
+      userId,
+      positionId: position.id,
+      contractAddress: position.contractAddress,
+      symbol: position.symbol,
+      action: 'partial_sell',
+      amountSol: soldValue,
+      tokenAmount: sellAmount,
+      price: position.currentPrice,
+      paperBalanceBefore: currentBalance,
+      paperBalanceAfter: newBalance,
+      pnl: soldValue - solReturned,
+      pnlPercentage: ((soldValue - solReturned) / solReturned) * 100,
+    });
+
+    const pnl = soldValue - solReturned;
+    const pnlEmoji = pnl > 0 ? '🟢' : '🔴';
+
+    logger.info(
+      `📝 PAPER PARTIAL SELL: ${sellAmount.toFixed(4)} ${position.symbol} @ $${position.currentPrice.toFixed(8)} | ` +
+      `${pnlEmoji} PnL: ${pnl.toFixed(4)} SOL | Balance: ${newBalance.toFixed(4)} SOL | Remaining: ${position.amount.toFixed(4)} tokens`
+    );
+
+    return true;
+  }
+
+  /**
+   * Execute real partial sell
+   */
+  private async executeRealPartialSell(
+    position: TradePosition,
+    sellAmount: number,
+    userId: number
+  ): Promise<boolean> {
+    const userWallet = await this.getUserWallet(userId);
+    if (!userWallet) {
+      logger.error(`No wallet configured for user ${userId} for partial sell`);
+      return false;
+    }
+
+    try {
+      // Get quote from Jupiter for partial amount
+      const tokenAmountInSmallestUnit = Math.floor(sellAmount * Math.pow(10, 9));
+      const quote = await jupiter.getQuote(
+        position.contractAddress,
+        SOL_MINT,
+        tokenAmountInSmallestUnit,
+        config.trading.slippageBps
+      );
+
+      if (!quote) {
+        logger.error('Failed to get Jupiter partial sell quote');
+        return false;
+      }
+
+      // Get and execute swap
+      const swapResult = await jupiter.getSwapTransaction(quote, userWallet.publicKey.toString());
+      if (!swapResult?.swapTransaction) {
+        logger.error('Failed to get partial sell swap transaction');
+        return false;
+      }
+
+      const transactionBuf = Buffer.from(swapResult.swapTransaction, 'base64');
+      const transaction = VersionedTransaction.deserialize(transactionBuf);
+      transaction.sign([userWallet]);
+
+      const signature = await this.connection.sendRawTransaction(
+        transaction.serialize(),
+        { skipPreflight: false, maxRetries: 3 }
+      );
+
+      const confirmation = await this.connection.confirmTransaction(signature, 'confirmed');
+      if (confirmation.value.err) {
+        logger.error('Partial sell transaction failed:', confirmation.value.err);
+        return false;
+      }
+
+      // Update position
+      position.amount -= sellAmount;
+      const sellPercentage = sellAmount / (position.amount + sellAmount);
+      position.solInvested -= position.solInvested * sellPercentage;
+      db.savePosition(position);
+
+      logger.info(
+        `✅ REAL PARTIAL SELL: ${sellAmount.toFixed(4)} ${position.symbol} @ $${position.currentPrice.toFixed(8)}`
+      );
+      logger.info(`Transaction: https://solscan.io/tx/${signature}`);
+
+      return true;
+    } catch (error) {
+      logger.error('Real partial sell execution error:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get advanced position config for a position
+   */
+  getAdvancedConfig(positionId: string): AdvancedPositionConfig | undefined {
+    return this.advancedPositionConfigs.get(positionId);
+  }
+
+  /**
+   * Set custom take profit tiers for a position
+   */
+  setTakeProfitTiers(positionId: string, tiers: TakeProfitTier[]): boolean {
+    const config = this.advancedPositionConfigs.get(positionId);
+    if (!config) return false;
+
+    config.takeProfitTiers = tiers;
+    this.saveAdvancedConfig(positionId, config);
+    return true;
+  }
+
+  /**
+   * Set trailing stop config for a position
+   */
+  setTrailingStop(positionId: string, trailingConfig: Partial<TrailingStopConfig>): boolean {
+    const config = this.advancedPositionConfigs.get(positionId);
+    if (!config) return false;
+
+    config.trailingStop = { ...config.trailingStop, ...trailingConfig };
+    this.saveAdvancedConfig(positionId, config);
+    return true;
+  }
+
+  /**
+   * Disable advanced trading for a position (use simple TP/SL)
+   */
+  disableAdvancedTrading(positionId: string): void {
+    this.advancedPositionConfigs.delete(positionId);
+    try {
+      db.deleteAdvancedPositionConfig(positionId);
+    } catch {
+      // Ignore if table doesn't exist
+    }
+  }
+
+  /**
+   * Get position status with advanced trading info
+   */
+  getAdvancedPositionStatus(position: TradePosition): string {
+    const config = this.advancedPositionConfigs.get(position.id);
+    if (!config) {
+      return 'Standard TP/SL';
+    }
+
+    const currentMultiplier = position.currentPrice / position.entryPrice;
+    const triggeredTiers = config.takeProfitTiers.filter(t => t.triggered).length;
+    const totalTiers = config.takeProfitTiers.length;
+
+    let status = `📊 Advanced Trading\n`;
+    status += `• Multiplier: ${currentMultiplier.toFixed(2)}x\n`;
+    status += `• TP Tiers: ${triggeredTiers}/${totalTiers} triggered\n`;
+    status += `• Remaining: ${config.remainingPercentage}%\n`;
+
+    if (config.trailingStop.isActive) {
+      status += `• 🔔 Trailing Stop ACTIVE\n`;
+      status += `  - High: $${config.trailingStop.highWaterMark.toFixed(8)}\n`;
+      status += `  - Stop: $${config.trailingStop.stopPrice.toFixed(8)}\n`;
+    } else if (config.trailingStop.enabled) {
+      const activationPrice = position.entryPrice * config.trailingStop.activationMultiplier;
+      status += `• Trailing Stop: Activates at $${activationPrice.toFixed(8)} (${config.trailingStop.activationMultiplier}x)\n`;
+    }
+
+    return status;
   }
 
   /**

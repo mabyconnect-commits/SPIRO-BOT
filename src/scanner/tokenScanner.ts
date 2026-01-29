@@ -4,8 +4,60 @@ import tradingEngine from '../trading/tradingEngine';
 import patternLearner from '../learning/patternLearner';
 import { config } from '../config';
 import logger from '../utils/logger';
-import { AnalysisResult } from '../types';
+import { AnalysisResult, MarketCapTierConfig } from '../types';
 import db from '../database';
+
+// Market cap tier type
+type MarketCapTier = 'lowCap' | 'midCap' | 'highCap';
+
+// Get market cap tier for a token
+function getMarketCapTier(marketCap: number): MarketCapTier | null {
+  const filters = config.scanner.marketCapFilters;
+
+  if (filters.lowCap.enabled &&
+      marketCap >= filters.lowCap.minMarketCapUsd &&
+      marketCap <= filters.lowCap.maxMarketCapUsd) {
+    return 'lowCap';
+  }
+
+  if (filters.midCap.enabled &&
+      marketCap >= filters.midCap.minMarketCapUsd &&
+      marketCap <= filters.midCap.maxMarketCapUsd) {
+    return 'midCap';
+  }
+
+  if (filters.highCap.enabled &&
+      marketCap >= filters.highCap.minMarketCapUsd &&
+      marketCap <= filters.highCap.maxMarketCapUsd) {
+    return 'highCap';
+  }
+
+  return null;
+}
+
+// Check if token passes market cap filters
+function passesMarketCapFilter(marketCap: number, liquidity: number): { passes: boolean; tier: MarketCapTier | null } {
+  const tier = getMarketCapTier(marketCap);
+
+  if (!tier) {
+    return { passes: false, tier: null };
+  }
+
+  const tierConfig = config.scanner.marketCapFilters[tier];
+
+  // Check liquidity requirement for this tier
+  if (liquidity < tierConfig.minLiquidityUsd) {
+    return { passes: false, tier };
+  }
+
+  return { passes: true, tier };
+}
+
+// Get position size multiplier for a market cap tier
+function getPositionSizeMultiplier(tier: MarketCapTier | null): number {
+  if (!tier) return 1.0;
+  return config.scanner.marketCapFilters[tier].positionSizeMultiplier;
+}
 
 // Constants for Alpha picks and scoring
 const ALPHA_SCORE_THRESHOLD = 29; // Score >= 29 is considered Alpha
@@ -149,6 +201,20 @@ export class TokenScanner {
   }
 
   /**
+   * Get market cap filter configuration
+   */
+  getMarketCapFilters() {
+    return config.scanner.marketCapFilters;
+  }
+
+  /**
+   * Get market cap tier for a given market cap value
+   */
+  getMarketCapTier(marketCap: number): string | null {
+    return getMarketCapTier(marketCap);
+  }
+
+  /**
    * Perform a scan
    */
   private async scan(): Promise<void> {
@@ -189,12 +255,15 @@ export class TokenScanner {
 
   /**
    * Get trending tokens from launchpads only (PumpFun, Meteora, etc.)
+   * Now with configurable market cap tier filtering
    */
   private async getTrendingTokens(): Promise<string[]> {
     const tokens: string[] = [];
+    const tierCounts = { lowCap: 0, midCap: 0, highCap: 0 };
 
     try {
       logger.info('🚀 Scanning launchpad tokens (PumpFun, Meteora, etc.)...');
+      logger.info(`   Market cap filters: Low($${config.scanner.marketCapFilters.lowCap.minMarketCapUsd/1000}k-$${config.scanner.marketCapFilters.lowCap.maxMarketCapUsd/1000}k) | Mid($${config.scanner.marketCapFilters.midCap.minMarketCapUsd/1000}k-$${config.scanner.marketCapFilters.midCap.maxMarketCapUsd/1000000}M) | High($${config.scanner.marketCapFilters.highCap.minMarketCapUsd/1000000}M+)`);
 
       // Get new pairs from Solana
       const allPairs = await dexScreener.getNewPairs();
@@ -216,21 +285,31 @@ export class TokenScanner {
         }
       }
 
-      // Process launchpad pairs
+      // Process launchpad pairs with market cap filtering
       for (const pair of launchpadPairs) {
         if (!pair.baseToken?.address) continue;
 
         const volume24h = parseFloat(pair.volume?.h24 || '0');
         const liquidity = parseFloat(pair.liquidity?.usd || '0');
+        const marketCap = parseFloat(pair.marketCap || pair.fdv || '0');
 
-        // Lower requirements for launchpad tokens (they're newer)
-        if (
-          volume24h >= config.scanner.minVolume24hUsd * 0.5 && // 50% of normal requirement
-          liquidity >= config.scanner.minLiquidityUsd * 0.5    // 50% of normal requirement
-        ) {
-          tokens.push(pair.baseToken.address);
-          logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} from ${pair.dexId}`);
+        // Check if token passes market cap filters
+        const { passes, tier } = passesMarketCapFilter(marketCap, liquidity);
+
+        if (!passes) {
+          continue; // Skip tokens outside configured market cap tiers
         }
+
+        // Check volume requirement (reduced for low cap, standard for others)
+        const volumeMultiplier = tier === 'lowCap' ? 0.3 : (tier === 'midCap' ? 0.5 : 1.0);
+        if (volume24h < config.scanner.minVolume24hUsd * volumeMultiplier) {
+          continue;
+        }
+
+        tokens.push(pair.baseToken.address);
+        if (tier) tierCounts[tier]++;
+
+        logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} [${tier?.toUpperCase()}] MC: $${(marketCap/1000).toFixed(1)}k | Liq: $${(liquidity/1000).toFixed(1)}k`);
       }
     } catch (error) {
       logger.error('Error fetching launchpad tokens:', error);
@@ -238,7 +317,7 @@ export class TokenScanner {
 
     // Remove duplicates
     const uniqueTokens = [...new Set(tokens)];
-    logger.info(`📊 Final count: ${uniqueTokens.length} unique launchpad tokens to analyze`);
+    logger.info(`📊 Final count: ${uniqueTokens.length} unique tokens (Low: ${tierCounts.lowCap}, Mid: ${tierCounts.midCap}, High: ${tierCounts.highCap})`);
     return uniqueTokens;
   }
 
@@ -526,7 +605,7 @@ export class TokenScanner {
         isAlpha
       );
 
-      // Determine trade size based on confidence and alpha status
+      // Determine trade size based on confidence, alpha status, and market cap tier
       const userSettings = db.getUserSettings(userId);
       const defaultTradeSize = userSettings?.defaultTradeSize || config.paperTrading.defaultTradeSize;
       const highConfidenceTradeSize = userSettings?.highConfidenceTradeSize || config.paperTrading.highConfidenceTradeSize;
@@ -534,7 +613,17 @@ export class TokenScanner {
 
       // Use higher trade size for Alpha picks and high confidence tokens
       const isHighConfidence = (analysis.confidence >= highConfidenceThreshold && analysis.overallScore >= 70) || isAlpha;
-      const tradeSize = isHighConfidence ? highConfidenceTradeSize : defaultTradeSize;
+      let tradeSize = isHighConfidence ? highConfidenceTradeSize : defaultTradeSize;
+
+      // Adjust trade size based on market cap tier
+      const marketCapTier = getMarketCapTier(analysis.token.marketCap);
+      const positionMultiplier = getPositionSizeMultiplier(marketCapTier);
+      tradeSize = tradeSize * positionMultiplier;
+
+      // Log market cap tier and adjusted position size
+      if (marketCapTier) {
+        logger.info(`📊 ${analysis.token.symbol} [${marketCapTier.toUpperCase()}] - Position size: ${tradeSize.toFixed(3)} SOL (${positionMultiplier}x multiplier)`);
+      }
 
       // PAPER TRADE ALL SCANNED TOKENS (not just buy signals)
       // This allows us to learn from all patterns, including failed ones

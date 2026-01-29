@@ -57,6 +57,8 @@ export interface AnalysisResult {
   recommendation: 'strong_buy' | 'buy' | 'hold' | 'avoid';
   matchedPatterns: RunnerPattern[];
   reasoning: string;
+  // Enhanced metrics (optional for backwards compatibility)
+  enhancedMetrics?: EnhancedTokenMetrics;
 }
 
 export interface RunnerPattern {
@@ -211,4 +213,98 @@ export interface HolderAnalysis {
     dangerousConcentration: boolean;
   };
   score: number; // 0-100 holder health score
+}
+
+// ============================================================
+// ENHANCED TRACKING TYPES
+// ============================================================
+
+/**
+ * Dev wallet behavior tracking
+ */
+export interface DevWalletBehavior {
+  devWalletAddress: string | null;
+  totalBalance: number;
+  percentageOfSupply: number;
+  recentSells: number;           // Sells in last 24h
+  sellPressure: number;          // 0-1 score (higher = more selling)
+  lastActivity: Date | null;
+  isActive: boolean;             // Has activity in last 24h
+  isDumping: boolean;            // Selling large amounts
+  holdingDuration: number;       // Hours since first acquired
+  suspiciousActivity: boolean;   // Red flag patterns
+}
+
+/**
+ * Buy/sell pressure metrics
+ */
+export interface BuySellPressure {
+  buys1h: number;
+  sells1h: number;
+  buys6h: number;
+  sells6h: number;
+  buys24h: number;
+  sells24h: number;
+  buyVolume24h: number;
+  sellVolume24h: number;
+  buyToSellRatio: number;        // buys / sells (>1 = bullish)
+  volumeRatio: number;           // buyVolume / sellVolume
+  netFlow: number;               // buyVolume - sellVolume (positive = inflow)
+  pressure: 'strong_buy' | 'buy' | 'neutral' | 'sell' | 'strong_sell';
+  momentum: 'accelerating' | 'stable' | 'decelerating';
+}
+
+/**
+ * Transaction velocity tracking
+ */
+export interface TransactionVelocity {
+  txns1m: number;                // Transactions in last 1 minute
+  txns5m: number;                // Transactions in last 5 minutes
+  txns1h: number;                // Transactions in last 1 hour
+  txns6h: number;                // Transactions in last 6 hours
+  txns24h: number;               // Transactions in last 24 hours
+  avgTxSize: number;             // Average transaction size in USD
+  velocityScore: number;         // 0-100 normalized velocity
+  velocityTrend: 'increasing' | 'stable' | 'decreasing';
+  isSpike: boolean;              // Abnormal activity detected
+  uniqueWallets24h: number;      // Unique wallets transacting
+}
+
+/**
+ * Enhanced token metrics combining all tracking data
+ */
+export interface EnhancedTokenMetrics {
+  devWallet: DevWalletBehavior;
+  buySellPressure: BuySellPressure;
+  transactionVelocity: TransactionVelocity;
+  overallHealthScore: number;    // 0-100 composite score
+  riskFlags: string[];           // List of detected risks
+  bullishSignals: string[];      // List of bullish indicators
+}
+
+/**
+ * Market cap tier configuration
+ */
+export interface MarketCapTierConfig {
+  name: string;
+  minMarketCap: number;
+  maxMarketCap: number;
+  minLiquidity: number;
+  positionSizeMultiplier: number;
+  riskMultiplier: number;
+}
+
+/**
+ * Scanner filter configuration
+ */
+export interface ScannerFilters {
+  minMarketCapUsd: number;
+  maxMarketCapUsd: number;
+  minLiquidityUsd: number;
+  maxLiquidityUsd: number;
+  minVolume24hUsd: number;
+  minHolders: number;
+  maxTokenAgeHours: number;
+  requireLiquidityLock: boolean;
+  excludeRugPull: boolean;
 }
