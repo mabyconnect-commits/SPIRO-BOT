@@ -4,6 +4,7 @@ import tokenAnalyzer, { AnalysisError } from '../analyzer/tokenAnalyzer';
 import tradingEngine from '../trading/tradingEngine';
 import tokenScanner from '../scanner/tokenScanner';
 import patternLearner from '../learning/patternLearner';
+import simulationEngine from '../simulation/simulationEngine';
 import db from '../database';
 import walletManager from '../services/walletManager';
 import subscriptionManager from '../services/subscriptionManager';
@@ -121,6 +122,13 @@ export class AlphaHunterBot {
     this.bot.onText(/\/alphapicks/, this.withAccessCheck(this.handleAlphaPicks.bind(this)));
     this.bot.onText(/\/moonshots/, this.withAccessCheck(this.handleMoonshots.bind(this)));
     this.bot.onText(/\/realtrade(?:\s+(on|off))?/, this.withAccessCheckMatch(this.handleRealTrade.bind(this)));
+
+    // Analytics and statistics commands - subscription required
+    this.bot.onText(/\/stats/, this.withAccessCheck(this.handleStats.bind(this)));
+    this.bot.onText(/\/leaderboard/, this.withAccessCheck(this.handleLeaderboard.bind(this)));
+    this.bot.onText(/\/performance/, this.withAccessCheck(this.handlePerformance.bind(this)));
+    this.bot.onText(/\/tierperformance/, this.withAccessCheck(this.handleTierPerformance.bind(this)));
+    this.bot.onText(/\/winners/, this.withAccessCheck(this.handleWinners.bind(this)));
 
     logger.info('Telegram bot commands registered');
   }
@@ -3561,6 +3569,132 @@ Use /hunt to start hunting!
     }
   }
 
+  // ============================================================
+  // ANALYTICS & STATISTICS COMMANDS
+  // ============================================================
+
+  private async handleStats(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const stats = simulationEngine.getStats();
+
+      const winRate = stats.completedSimulations > 0
+        ? ((stats.winners / stats.completedSimulations) * 100).toFixed(1)
+        : '0';
+
+      let response = `📊 *Simulation Statistics*\n\n`;
+      response += `📈 *Overview*\n`;
+      response += `• Total Simulations: ${stats.totalSimulations}\n`;
+      response += `• Active: ${stats.activeSimulations}\n`;
+      response += `• Completed: ${stats.completedSimulations}\n\n`;
+
+      response += `🎯 *Performance*\n`;
+      response += `• Win Rate: ${winRate}%\n`;
+      response += `• Avg ROI: ${stats.avgROI.toFixed(1)}%\n`;
+      response += `• Best: +${stats.bestROI.toFixed(1)}%\n`;
+      response += `• Worst: ${stats.worstROI.toFixed(1)}%\n\n`;
+
+      response += `🏆 *Multiplier Achievements*\n`;
+      response += `• 5x Winners: ${stats.fiveXCount} 🚀\n`;
+      response += `• 10x Winners: ${stats.tenXCount} 🚀🚀\n`;
+      response += `• 100x Winners: ${stats.hundredXCount} 🚀🚀🚀\n`;
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleStats:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Error fetching statistics.');
+    }
+  }
+
+  private async handleLeaderboard(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const report = simulationEngine.generateLeaderboardReport(10);
+
+      await this.bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleLeaderboard:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Error fetching leaderboard.');
+    }
+  }
+
+  private async handlePerformance(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const report = simulationEngine.generateReport();
+
+      await this.bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handlePerformance:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Error fetching performance report.');
+    }
+  }
+
+  private async handleTierPerformance(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const performance = simulationEngine.getPerformanceByTier();
+
+      let response = `📊 *Performance by Market Cap Tier*\n\n`;
+
+      const tiers = [
+        { key: 'micro', name: 'Micro Cap (<$50k)', emoji: '🔬' },
+        { key: 'low', name: 'Low Cap ($50k-$500k)', emoji: '📉' },
+        { key: 'mid', name: 'Mid Cap ($500k-$5M)', emoji: '📊' },
+        { key: 'high', name: 'High Cap (>$5M)', emoji: '📈' },
+      ] as const;
+
+      for (const tier of tiers) {
+        const data = performance[tier.key];
+        if (data.trades > 0) {
+          response += `${tier.emoji} *${tier.name}*\n`;
+          response += `   Trades: ${data.trades} | Win: ${data.winRate.toFixed(0)}%\n`;
+          response += `   Avg ROI: ${data.avgROI.toFixed(1)}% | 5x: ${data.best5x} | 10x: ${data.best10x}\n\n`;
+        } else {
+          response += `${tier.emoji} *${tier.name}*\n`;
+          response += `   No trades yet\n\n`;
+        }
+      }
+
+      response += `💡 *Tip*: Lower cap tokens have higher risk but also higher reward potential.`;
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleTierPerformance:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Error fetching tier performance.');
+    }
+  }
+
+  private async handleWinners(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const chatId = msg.chat.id;
+      const winners = simulationEngine.getRecentBigWinners(48, 5);
+
+      if (winners.length === 0) {
+        await this.bot.sendMessage(chatId, '🏆 *Recent Winners*\n\nNo 5x+ winners in the last 48 hours.', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      let response = `🏆 *Recent Big Winners (48h)*\n\n`;
+
+      for (const w of winners.slice(0, 15)) {
+        const emoji = w.is100x ? '💯' : w.is10x ? '🔥' : '✨';
+        const hoursAgo = Math.round((Date.now() - w.timestamp) / (60 * 60 * 1000));
+
+        response += `${emoji} *${w.symbol}*\n`;
+        response += `   ${w.profitMultiple.toFixed(1)}x | ${w.roi.toFixed(0)}% ROI\n`;
+        response += `   Strategy: ${w.strategyName}\n`;
+        response += `   Held: ${w.timeHeldMinutes.toFixed(0)}m | ${hoursAgo}h ago\n`;
+        response += `   \`${w.contractAddress.substring(0, 20)}...\`\n\n`;
+      }
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleWinners:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Error fetching winners.');
+    }
+  }
+
   async start(): Promise<void> {
     try {
       // Register bot commands with Telegram
@@ -3595,6 +3729,11 @@ Use /hunt to start hunting!
         { command: 'favorites', description: 'View your favorite tokens' },
         { command: 'dcaorders', description: 'View active DCA orders' },
         { command: 'tpslorders', description: 'View active TP/SL orders' },
+        { command: 'stats', description: 'View simulation statistics' },
+        { command: 'leaderboard', description: 'View top performing tokens' },
+        { command: 'performance', description: 'View strategy performance report' },
+        { command: 'tierperformance', description: 'View performance by market cap tier' },
+        { command: 'winners', description: 'View recent big winners (5x+)' },
       ]);
 
       logger.info('✅ Bot commands registered with Telegram');

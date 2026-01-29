@@ -52,6 +52,7 @@ export interface ActiveSimulation {
   status: 'active' | 'closed';
   exitReason?: string;
   analysisSnapshot: AnalysisResult;
+  marketCapTier?: MarketCapTier;
 }
 
 export interface SimulationResult {
@@ -72,7 +73,63 @@ export interface SimulationResult {
   is100x: boolean;
   exitReason: string;
   timestamp: number;
+  marketCapTier?: MarketCapTier;
 }
+
+// ============================================================
+// MARKET CONDITIONS
+// ============================================================
+
+export type MarketCapTier = 'micro' | 'low' | 'mid' | 'high';
+
+export interface MarketCondition {
+  tier: MarketCapTier;
+  marketCap: number;
+  liquidity: number;
+  volatilityLevel: 'low' | 'medium' | 'high';
+  volumeLevel: 'low' | 'medium' | 'high';
+}
+
+// Market cap thresholds (in USD)
+const MARKET_CAP_TIERS = {
+  micro: { min: 0, max: 50000 },        // < $50k - extremely risky, high reward potential
+  low: { min: 50000, max: 500000 },     // $50k - $500k - early stage, volatile
+  mid: { min: 500000, max: 5000000 },   // $500k - $5M - established but still volatile
+  high: { min: 5000000, max: Infinity }, // > $5M - more stable, lower multiples
+};
+
+// Strategy adjustments per market cap tier
+const TIER_ADJUSTMENTS: Record<MarketCapTier, {
+  stopLossMultiplier: number;
+  takeProfitMultiplier: number;
+  positionSizeMultiplier: number;
+  maxHoldMultiplier: number;
+}> = {
+  micro: {
+    stopLossMultiplier: 1.5,      // Wider stops for volatile micro caps
+    takeProfitMultiplier: 2.0,    // Higher targets possible
+    positionSizeMultiplier: 0.5,  // Smaller positions due to risk
+    maxHoldMultiplier: 0.5,       // Shorter holds - quick in/out
+  },
+  low: {
+    stopLossMultiplier: 1.2,
+    takeProfitMultiplier: 1.5,
+    positionSizeMultiplier: 0.7,
+    maxHoldMultiplier: 0.75,
+  },
+  mid: {
+    stopLossMultiplier: 1.0,      // Standard parameters
+    takeProfitMultiplier: 1.0,
+    positionSizeMultiplier: 1.0,
+    maxHoldMultiplier: 1.0,
+  },
+  high: {
+    stopLossMultiplier: 0.8,      // Tighter stops
+    takeProfitMultiplier: 0.7,    // Lower targets
+    positionSizeMultiplier: 1.3,  // Can take larger positions
+    maxHoldMultiplier: 1.5,       // Can hold longer
+  },
+};
 
 // ============================================================
 // BUILT-IN STRATEGIES
@@ -427,27 +484,187 @@ export class SimulationEngine {
   }
 
   // ============================================================
+  // MARKET CONDITION DETECTION
+  // ============================================================
+
+  /**
+   * Detect market cap tier for a token
+   */
+  getMarketCapTier(marketCap: number): MarketCapTier {
+    if (marketCap < MARKET_CAP_TIERS.micro.max) return 'micro';
+    if (marketCap < MARKET_CAP_TIERS.low.max) return 'low';
+    if (marketCap < MARKET_CAP_TIERS.mid.max) return 'mid';
+    return 'high';
+  }
+
+  /**
+   * Analyze market conditions for a token
+   */
+  analyzeMarketCondition(analysis: AnalysisResult): MarketCondition {
+    const marketCap = analysis.token.marketCap;
+    const liquidity = analysis.token.liquidity;
+    const volume = analysis.token.volume24h;
+    const volatility = analysis.technical.volatility;
+
+    const tier = this.getMarketCapTier(marketCap);
+
+    // Determine volatility level
+    let volatilityLevel: 'low' | 'medium' | 'high' = 'medium';
+    if (volatility < 0.3) volatilityLevel = 'low';
+    else if (volatility > 0.6) volatilityLevel = 'high';
+
+    // Determine volume level relative to market cap
+    const volumeToMcRatio = marketCap > 0 ? volume / marketCap : 0;
+    let volumeLevel: 'low' | 'medium' | 'high' = 'medium';
+    if (volumeToMcRatio < 0.1) volumeLevel = 'low';
+    else if (volumeToMcRatio > 0.5) volumeLevel = 'high';
+
+    return {
+      tier,
+      marketCap,
+      liquidity,
+      volatilityLevel,
+      volumeLevel,
+    };
+  }
+
+  /**
+   * Adapt strategy parameters based on market conditions
+   */
+  adaptStrategyForMarket(
+    strategy: SimulationStrategy,
+    condition: MarketCondition
+  ): SimulationStrategy {
+    const adjustments = TIER_ADJUSTMENTS[condition.tier];
+
+    // Create adapted strategy with adjusted parameters
+    const adapted: SimulationStrategy = {
+      ...strategy,
+      id: `${strategy.id}_${condition.tier}`,
+      name: `${strategy.name} (${condition.tier.toUpperCase()})`,
+      positionSizePct: strategy.positionSizePct * adjustments.positionSizeMultiplier,
+      stopLossPct: strategy.stopLossPct * adjustments.stopLossMultiplier,
+      maxHoldMinutes: Math.round(strategy.maxHoldMinutes * adjustments.maxHoldMultiplier),
+      takeProfitTiers: strategy.takeProfitTiers.map(t =>
+        Math.round(t * adjustments.takeProfitMultiplier)
+      ),
+    };
+
+    // Adapt exit conditions for volatility
+    if (condition.volatilityLevel === 'high') {
+      // More aggressive trailing stops in high volatility
+      adapted.exitCondition = (sim) => {
+        const baseExit = strategy.exitCondition(sim);
+        if (baseExit.shouldExit) return baseExit;
+
+        // Tighter trailing stop in high volatility after profit
+        if (sim.roi > 30) {
+          const trailStop = sim.highestPrice * 0.6; // 40% trail
+          if (sim.currentPrice <= trailStop) {
+            return { shouldExit: true, reason: 'Volatility trailing stop' };
+          }
+        }
+        return { shouldExit: false, reason: '' };
+      };
+    }
+
+    return adapted;
+  }
+
+  /**
+   * Get strategy performance by market cap tier
+   */
+  getPerformanceByTier(): Record<MarketCapTier, {
+    trades: number;
+    winRate: number;
+    avgROI: number;
+    best5x: number;
+    best10x: number;
+  }> {
+    const performance: Record<MarketCapTier, {
+      trades: number;
+      wins: number;
+      totalROI: number;
+      fiveX: number;
+      tenX: number;
+    }> = {
+      micro: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+      low: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+      mid: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+      high: { trades: 0, wins: 0, totalROI: 0, fiveX: 0, tenX: 0 },
+    };
+
+    for (const result of this.completedResults) {
+      const tier = result.marketCapTier || 'mid'; // Default to mid if not recorded
+      performance[tier].trades++;
+      if (result.outcome === 'win') performance[tier].wins++;
+      performance[tier].totalROI += result.roi;
+      if (result.is5x) performance[tier].fiveX++;
+      if (result.is10x) performance[tier].tenX++;
+    }
+
+    return {
+      micro: {
+        trades: performance.micro.trades,
+        winRate: performance.micro.trades > 0 ? (performance.micro.wins / performance.micro.trades) * 100 : 0,
+        avgROI: performance.micro.trades > 0 ? performance.micro.totalROI / performance.micro.trades : 0,
+        best5x: performance.micro.fiveX,
+        best10x: performance.micro.tenX,
+      },
+      low: {
+        trades: performance.low.trades,
+        winRate: performance.low.trades > 0 ? (performance.low.wins / performance.low.trades) * 100 : 0,
+        avgROI: performance.low.trades > 0 ? performance.low.totalROI / performance.low.trades : 0,
+        best5x: performance.low.fiveX,
+        best10x: performance.low.tenX,
+      },
+      mid: {
+        trades: performance.mid.trades,
+        winRate: performance.mid.trades > 0 ? (performance.mid.wins / performance.mid.trades) * 100 : 0,
+        avgROI: performance.mid.trades > 0 ? performance.mid.totalROI / performance.mid.trades : 0,
+        best5x: performance.mid.fiveX,
+        best10x: performance.mid.tenX,
+      },
+      high: {
+        trades: performance.high.trades,
+        winRate: performance.high.trades > 0 ? (performance.high.wins / performance.high.trades) * 100 : 0,
+        avgROI: performance.high.trades > 0 ? performance.high.totalROI / performance.high.trades : 0,
+        best5x: performance.high.fiveX,
+        best10x: performance.high.tenX,
+      },
+    };
+  }
+
+  // ============================================================
   // CORE: Simulate token with all strategies
   // ============================================================
 
   /**
    * Run all applicable strategies on a discovered token
+   * Now with market-adaptive strategy parameters
    */
   async simulateToken(analysis: AnalysisResult): Promise<ActiveSimulation[]> {
     const created: ActiveSimulation[] = [];
 
+    // Analyze market conditions for this token
+    const marketCondition = this.analyzeMarketCondition(analysis);
+
     for (const strategy of this.strategies) {
       try {
         if (strategy.entryCondition(analysis)) {
-          const sim = this.createSimulation(strategy, analysis);
+          // Adapt strategy parameters based on market conditions
+          const adaptedStrategy = this.adaptStrategyForMarket(strategy, marketCondition);
+
+          const sim = this.createSimulation(adaptedStrategy, analysis, marketCondition.tier);
           this.activeSimulations.set(sim.id, sim);
           created.push(sim);
           this.stats.totalSimulations++;
           this.stats.activeSimulations++;
 
           logger.info(
-            `🧪 SIM [${strategy.name}] ${analysis.token.symbol}: ` +
-            `entry $${analysis.token.price.toFixed(8)} | ${strategy.positionSizePct}% size`
+            `🧪 SIM [${adaptedStrategy.name}] ${analysis.token.symbol}: ` +
+            `entry $${analysis.token.price.toFixed(8)} | ${adaptedStrategy.positionSizePct.toFixed(1)}% size | ` +
+            `MC: $${(marketCondition.marketCap / 1000).toFixed(0)}k (${marketCondition.tier})`
           );
         }
       } catch (error) {
@@ -523,7 +740,11 @@ export class SimulationEngine {
   // SIMULATION MANAGEMENT
   // ============================================================
 
-  private createSimulation(strategy: SimulationStrategy, analysis: AnalysisResult): ActiveSimulation {
+  private createSimulation(
+    strategy: SimulationStrategy,
+    analysis: AnalysisResult,
+    marketCapTier?: MarketCapTier
+  ): ActiveSimulation {
     const solAmount = this.virtualBalance * (strategy.positionSizePct / 100);
 
     return {
@@ -545,6 +766,7 @@ export class SimulationEngine {
       partialExitsDone: 0,
       status: 'active',
       analysisSnapshot: analysis,
+      marketCapTier,
     };
   }
 
@@ -604,6 +826,7 @@ export class SimulationEngine {
       is100x,
       exitReason: reason,
       timestamp: Date.now(),
+      marketCapTier: sim.marketCapTier,
     };
 
     // Update stats
