@@ -203,12 +203,36 @@ const SIMULATION_STRATEGIES: SimulationStrategy[] = [
 // SIMULATION ENGINE
 // ============================================================
 
+// Winner notification callback type
+export type WinnerCallback = (result: SimulationResult, multiplier: '5x' | '10x' | '100x') => void;
+
+// Leaderboard entry
+export interface LeaderboardEntry {
+  rank: number;
+  contractAddress: string;
+  symbol: string;
+  bestMultiple: number;
+  avgROI: number;
+  winCount: number;
+  totalTrades: number;
+  winRate: number;
+  lastWinTimestamp: number;
+}
+
 export class SimulationEngine {
   private activeSimulations: Map<string, ActiveSimulation> = new Map();
   private completedResults: SimulationResult[] = [];
   private strategies: SimulationStrategy[] = [...SIMULATION_STRATEGIES];
   private monitorInterval: NodeJS.Timeout | null = null;
   private virtualBalance: number = 1000; // 1000 SOL virtual balance for sims
+
+  // Winner notification callbacks
+  private winnerCallbacks: WinnerCallback[] = [];
+
+  // Leaderboard cache
+  private leaderboardCache: LeaderboardEntry[] = [];
+  private leaderboardCacheTime: number = 0;
+  private leaderboardCacheTTL: number = 60000; // 1 minute
 
   private stats = {
     totalSimulations: 0,
@@ -227,6 +251,179 @@ export class SimulationEngine {
   constructor() {
     this.loadCompletedResults();
     logger.info(`SimulationEngine initialized with ${this.strategies.length} strategies`);
+  }
+
+  // ============================================================
+  // WINNER NOTIFICATIONS
+  // ============================================================
+
+  /**
+   * Register a callback to be notified when a simulation hits a multiplier target
+   */
+  onWinner(callback: WinnerCallback): void {
+    this.winnerCallbacks.push(callback);
+  }
+
+  /**
+   * Remove a winner callback
+   */
+  removeWinnerCallback(callback: WinnerCallback): void {
+    const idx = this.winnerCallbacks.indexOf(callback);
+    if (idx !== -1) {
+      this.winnerCallbacks.splice(idx, 1);
+    }
+  }
+
+  /**
+   * Notify all registered callbacks about a winner
+   */
+  private notifyWinner(result: SimulationResult): void {
+    if (result.is100x) {
+      logger.info(`🚀🚀🚀 100X WINNER DETECTED: ${result.symbol} - ${result.profitMultiple.toFixed(0)}x return!`);
+      for (const callback of this.winnerCallbacks) {
+        try {
+          callback(result, '100x');
+        } catch (e) {
+          logger.error('Winner callback error:', e);
+        }
+      }
+    } else if (result.is10x) {
+      logger.info(`🚀🚀 10X WINNER: ${result.symbol} - ${result.profitMultiple.toFixed(0)}x return!`);
+      for (const callback of this.winnerCallbacks) {
+        try {
+          callback(result, '10x');
+        } catch (e) {
+          logger.error('Winner callback error:', e);
+        }
+      }
+    } else if (result.is5x) {
+      logger.info(`🚀 5X WINNER: ${result.symbol} - ${result.profitMultiple.toFixed(0)}x return!`);
+      for (const callback of this.winnerCallbacks) {
+        try {
+          callback(result, '5x');
+        } catch (e) {
+          logger.error('Winner callback error:', e);
+        }
+      }
+    }
+  }
+
+  // ============================================================
+  // LEADERBOARD
+  // ============================================================
+
+  /**
+   * Get the top performing tokens leaderboard
+   */
+  getLeaderboard(limit: number = 20): LeaderboardEntry[] {
+    const now = Date.now();
+
+    // Return cached if fresh
+    if (now - this.leaderboardCacheTime < this.leaderboardCacheTTL && this.leaderboardCache.length > 0) {
+      return this.leaderboardCache.slice(0, limit);
+    }
+
+    // Build leaderboard from completed results
+    const tokenStats = new Map<string, {
+      contractAddress: string;
+      symbol: string;
+      results: SimulationResult[];
+    }>();
+
+    for (const result of this.completedResults) {
+      const existing = tokenStats.get(result.contractAddress) || {
+        contractAddress: result.contractAddress,
+        symbol: result.symbol,
+        results: [],
+      };
+      existing.results.push(result);
+      tokenStats.set(result.contractAddress, existing);
+    }
+
+    // Calculate leaderboard entries
+    const entries: LeaderboardEntry[] = [];
+
+    for (const [address, data] of tokenStats) {
+      const results = data.results;
+      const wins = results.filter(r => r.outcome === 'win');
+      const bestMultiple = Math.max(...results.map(r => r.profitMultiple));
+      const avgROI = results.reduce((s, r) => s + r.roi, 0) / results.length;
+      const lastWin = wins.length > 0 ? Math.max(...wins.map(r => r.timestamp)) : 0;
+
+      entries.push({
+        rank: 0, // Will be set after sorting
+        contractAddress: address,
+        symbol: data.symbol,
+        bestMultiple,
+        avgROI,
+        winCount: wins.length,
+        totalTrades: results.length,
+        winRate: (wins.length / results.length) * 100,
+        lastWinTimestamp: lastWin,
+      });
+    }
+
+    // Sort by best multiple, then by avg ROI
+    entries.sort((a, b) => {
+      if (b.bestMultiple !== a.bestMultiple) return b.bestMultiple - a.bestMultiple;
+      return b.avgROI - a.avgROI;
+    });
+
+    // Assign ranks
+    entries.forEach((e, i) => e.rank = i + 1);
+
+    // Cache the results
+    this.leaderboardCache = entries;
+    this.leaderboardCacheTime = now;
+
+    return entries.slice(0, limit);
+  }
+
+  /**
+   * Get recent big winners (5x+)
+   */
+  getRecentBigWinners(hours: number = 24, minMultiple: number = 5): SimulationResult[] {
+    const cutoff = Date.now() - hours * 60 * 60 * 1000;
+    return this.completedResults
+      .filter(r => r.timestamp > cutoff && r.profitMultiple >= minMultiple)
+      .sort((a, b) => b.profitMultiple - a.profitMultiple);
+  }
+
+  /**
+   * Generate leaderboard report
+   */
+  generateLeaderboardReport(limit: number = 10): string {
+    const leaderboard = this.getLeaderboard(limit);
+
+    if (leaderboard.length === 0) {
+      return '🏆 *Leaderboard*\n\nNo completed simulations yet.';
+    }
+
+    let report = `🏆 *Top ${Math.min(limit, leaderboard.length)} Performing Tokens*\n\n`;
+
+    for (const entry of leaderboard) {
+      const medal = entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : `${entry.rank}.`;
+      const multiplierEmoji = entry.bestMultiple >= 100 ? '🚀🚀🚀' :
+                              entry.bestMultiple >= 10 ? '🚀🚀' :
+                              entry.bestMultiple >= 5 ? '🚀' : '';
+
+      report += `${medal} *${entry.symbol}* ${multiplierEmoji}\n`;
+      report += `   Best: ${entry.bestMultiple.toFixed(1)}x | Avg: ${entry.avgROI.toFixed(0)}%\n`;
+      report += `   W/L: ${entry.winCount}/${entry.totalTrades - entry.winCount} (${entry.winRate.toFixed(0)}%)\n\n`;
+    }
+
+    // Add recent big winners section
+    const recentWinners = this.getRecentBigWinners(24, 5);
+    if (recentWinners.length > 0) {
+      report += `\n🌟 *Recent Big Winners (24h)*\n`;
+      for (const w of recentWinners.slice(0, 5)) {
+        const emoji = w.is100x ? '💯' : w.is10x ? '🔥' : '✨';
+        const timeAgo = Math.round((Date.now() - w.timestamp) / 60000);
+        report += `${emoji} ${w.symbol}: ${w.profitMultiple.toFixed(1)}x (${timeAgo}m ago)\n`;
+      }
+    }
+
+    return report;
   }
 
   // ============================================================
@@ -440,6 +637,11 @@ export class SimulationEngine {
       `${sim.roi.toFixed(1)}% ROI (${sim.profitMultiple.toFixed(1)}x) | ` +
       `${timeHeldMinutes.toFixed(0)}m | ${reason}`
     );
+
+    // Notify winner callbacks
+    if (is5x || is10x || is100x) {
+      this.notifyWinner(result);
+    }
 
     return result;
   }

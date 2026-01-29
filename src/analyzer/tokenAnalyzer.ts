@@ -1,6 +1,7 @@
 import { dexScreener, birdeye, helius, jupiter } from '../services/apiClients';
 import { TokenData, AnalysisResult, WalletSignal, TechnicalSignal, FundamentalSignal, SocialSignal, RunnerPattern } from '../types';
 import { RUNNER_PATTERNS } from '../config';
+import { patternDiscovery } from '../learning/patternDiscovery';
 import logger from '../utils/logger';
 import db from '../database';
 
@@ -167,10 +168,14 @@ export class TokenAnalyzer {
       const fundamental = this.analyzeFundamental(tokenData, dexData, birdeyeData, holderAnalysis);
       const social = this.analyzeSocial(tokenData, dexData);
 
-      // Match against patterns
-      const matchedPatterns = this.matchPatterns(walletSignals, technical, fundamental, social);
+      // Calculate overall score first (needed for pattern matching)
+      const preliminaryScore = this.calculateOverallScore(walletSignals, technical, fundamental, social, []);
+      const preliminaryConfidence = 0.5; // Base confidence before pattern matching
 
-      // Calculate overall score
+      // Match against patterns (including discovered patterns)
+      const matchedPatterns = this.matchPatterns(walletSignals, technical, fundamental, social, tokenData, preliminaryScore, preliminaryConfidence);
+
+      // Recalculate overall score with matched patterns
       const overallScore = this.calculateOverallScore(walletSignals, technical, fundamental, social, matchedPatterns);
       const confidence = this.calculateConfidence(matchedPatterns);
 
@@ -513,12 +518,16 @@ export class TokenAnalyzer {
     walletSignals: WalletSignal[],
     technical: TechnicalSignal,
     fundamental: FundamentalSignal,
-    social: SocialSignal
+    social: SocialSignal,
+    tokenData?: TokenData,
+    overallScore?: number,
+    analysisConfidence?: number
   ): RunnerPattern[] {
     const matched: RunnerPattern[] = [];
 
+    // Match against built-in patterns
     for (const pattern of RUNNER_PATTERNS) {
-      const score = this.scorePattern(pattern, walletSignals, technical, fundamental, social);
+      const score = this.scorePattern(pattern, walletSignals, technical, fundamental, social, tokenData, overallScore, analysisConfidence);
 
       if (score > 0.5) { // Pattern matches if score > 50%
         // Get learning data for this pattern
@@ -534,6 +543,24 @@ export class TokenAnalyzer {
       }
     }
 
+    // Match against auto-discovered patterns from ML
+    try {
+      const discoveredPatterns = patternDiscovery.getActivePatterns();
+      for (const pattern of discoveredPatterns) {
+        const score = this.scorePattern(pattern, walletSignals, technical, fundamental, social, tokenData, overallScore, analysisConfidence);
+
+        if (score > 0.5) {
+          matched.push({
+            ...pattern,
+            confidence: score,
+            // Discovered patterns already have their stats
+          });
+        }
+      }
+    } catch (error) {
+      logger.debug('Could not load discovered patterns:', error);
+    }
+
     // Sort by confidence
     return matched.sort((a, b) => b.confidence - a.confidence);
   }
@@ -543,13 +570,16 @@ export class TokenAnalyzer {
     walletSignals: WalletSignal[],
     technical: TechnicalSignal,
     fundamental: FundamentalSignal,
-    social: SocialSignal
+    social: SocialSignal,
+    tokenData?: TokenData,
+    overallScore?: number,
+    analysisConfidence?: number
   ): number {
     let totalScore = 0;
     let totalWeight = 0;
 
     for (const signal of pattern.signals) {
-      const value = this.getSignalValue(signal, walletSignals, technical, fundamental, social);
+      const value = this.getSignalValue(signal, walletSignals, technical, fundamental, social, tokenData, overallScore, analysisConfidence);
 
       if (value !== null) {
         const matches = this.evaluateSignal(signal, value);
@@ -568,7 +598,10 @@ export class TokenAnalyzer {
     walletSignals: WalletSignal[],
     technical: TechnicalSignal,
     fundamental: FundamentalSignal,
-    social: SocialSignal
+    social: SocialSignal,
+    tokenData?: TokenData,
+    overallScore?: number,
+    analysisConfidence?: number
   ): number | null {
     switch (signal.type) {
       case 'wallet':
@@ -584,15 +617,31 @@ export class TokenAnalyzer {
         if (signal.metric === 'liquidityScore') return technical.liquidityScore;
         if (signal.metric === 'priceAction') return technical.priceAction === 'bullish' ? 1 : 0;
         if (signal.metric === 'volatility') return technical.volatility;
+        if (signal.metric === 'rsi') return technical.rsi;
+        // Token data metrics accessible via technical type
+        if (tokenData) {
+          if (signal.metric === 'volume24h') return tokenData.volume24h;
+          if (signal.metric === 'priceChange24h') return tokenData.priceChange24h;
+        }
+        // Overall analysis metrics
+        if (signal.metric === 'overallScore') return overallScore ?? 0;
+        if (signal.metric === 'confidence') return analysisConfidence ?? 0;
         break;
 
       case 'fundamental':
         if (signal.metric === 'tokenAge') return fundamental.tokenAge;
+        if (signal.metric === 'tokenAgeHours') return fundamental.tokenAge; // Alias
         if (signal.metric === 'liquidityLocked') return fundamental.liquidityLocked ? 1 : 0;
         if (signal.metric === 'uniqueHolders') return fundamental.uniqueHolders;
+        if (signal.metric === 'holders') return fundamental.uniqueHolders; // Alias
         if (signal.metric === 'topHolderPercentage') return fundamental.topHolderPercentage;
         if (signal.metric === 'holderConcentration') return fundamental.holderConcentration;
         if (signal.metric === 'devWalletLocked') return fundamental.devWalletLocked ? 1 : 0;
+        // Token data metrics accessible via fundamental type
+        if (tokenData) {
+          if (signal.metric === 'marketCap') return tokenData.marketCap;
+          if (signal.metric === 'liquidity') return tokenData.liquidity;
+        }
         break;
 
       case 'social':
