@@ -130,6 +130,17 @@ export class AlphaHunterBot {
     this.bot.onText(/\/tierperformance/, this.withAccessCheck(this.handleTierPerformance.bind(this)));
     this.bot.onText(/\/winners/, this.withAccessCheck(this.handleWinners.bind(this)));
 
+    // Strategy management commands - subscription required
+    this.bot.onText(/\/createstrategy/, this.withAccessCheck(this.handleCreateStrategy.bind(this)));
+    this.bot.onText(/\/strategies/, this.withAccessCheck(this.handleStrategies.bind(this)));
+    this.bot.onText(/\/simulation/, this.withAccessCheck(this.handleSimulation.bind(this)));
+    this.bot.onText(/\/profits/, this.withAccessCheck(this.handleProfits.bind(this)));
+
+    // Wallet connection commands - subscription required
+    this.bot.onText(/\/connectwallet/, this.withAccessCheck(this.handleConnectWallet.bind(this)));
+    this.bot.onText(/\/enabletrading/, this.withAccessCheck(this.handleEnableTrading.bind(this)));
+    this.bot.onText(/\/disabletrading/, this.withAccessCheck(this.handleDisableTrading.bind(this)));
+
     logger.info('Telegram bot commands registered');
   }
 
@@ -3695,6 +3706,339 @@ Use /hunt to start hunting!
     }
   }
 
+  // ============================================================
+  // STRATEGY MANAGEMENT HANDLERS
+  // ============================================================
+
+  private async handleCreateStrategy(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Get current user settings
+      const settings = db.getUserSettings(userId);
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '📈 Low Cap Sniper', callback_data: 'strategy_lowcap' },
+            { text: '💎 High Cap Safe', callback_data: 'strategy_highcap' },
+          ],
+          [
+            { text: '🚀 Aggressive Growth', callback_data: 'strategy_aggressive' },
+            { text: '🛡️ Conservative', callback_data: 'strategy_conservative' },
+          ],
+          [
+            { text: '⚡ Custom Strategy', callback_data: 'strategy_custom' },
+          ],
+          [
+            { text: '❌ Cancel', callback_data: 'close' },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(chatId,
+        `🎯 **Create Trading Strategy**\n\n` +
+        `Choose a strategy template or create a custom one:\n\n` +
+        `📈 **Low Cap Sniper** - $3k-$100k MC, higher risk/reward\n` +
+        `💎 **High Cap Safe** - $1M+ MC, lower risk, stable\n` +
+        `🚀 **Aggressive Growth** - High confidence, larger positions\n` +
+        `🛡️ **Conservative** - Low risk, smaller positions\n` +
+        `⚡ **Custom** - Define your own parameters\n\n` +
+        `Current preset: **${settings?.preset || 'balanced'}**`,
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+    } catch (error) {
+      logger.error('Error in handleCreateStrategy:', error);
+      await this.bot.sendMessage(chatId, '❌ Error creating strategy menu.');
+    }
+  }
+
+  private async handleStrategies(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Import pattern learner for strategy rankings
+      const patternLearner = (await import('../learning/patternLearner')).default;
+      const rankings = patternLearner.getStrategyRankings();
+      const blacklisted = patternLearner.getBlacklistedPatterns();
+
+      let response = `📊 **Strategy Rankings**\n\n`;
+
+      if (rankings.length === 0) {
+        response += `_No strategies with enough data yet._\n`;
+        response += `_Strategies need at least 5 trades to rank._\n\n`;
+      } else {
+        rankings.slice(0, 10).forEach((r, i) => {
+          const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+          const statusEmoji = r.isActive ? '✅' : '⚠️';
+          response += `${medal} ${statusEmoji} **${r.patternName}**\n`;
+          response += `   Win: ${(r.winRate * 100).toFixed(0)}% | Profit: ${r.profitability.toFixed(0)}% | Trades: ${r.sampleSize}\n`;
+          response += `   Risk-Adjusted: ${r.riskAdjustedReturn.toFixed(1)}\n\n`;
+        });
+      }
+
+      if (blacklisted.length > 0) {
+        response += `\n🚫 **Blacklisted Strategies (${blacklisted.length}):**\n`;
+        blacklisted.forEach(p => {
+          response += `• ${p.patternName}: ${p.blacklistReason || 'Poor performance'}\n`;
+        });
+      }
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '🔄 Refresh', callback_data: 'strategies_refresh' },
+            { text: '➕ Create Strategy', callback_data: 'create_strategy' },
+          ],
+          [
+            { text: '📈 Enable Top', callback_data: 'enable_top_strategies' },
+            { text: '🔒 Disable All', callback_data: 'disable_all_strategies' },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown', reply_markup: keyboard });
+    } catch (error) {
+      logger.error('Error in handleStrategies:', error);
+      await this.bot.sendMessage(chatId, '❌ Error fetching strategies.');
+    }
+  }
+
+  private async handleSimulation(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Get simulation stats
+      const paperStats = db.getPaperTradeStats(userId);
+      const balance = db.getPaperBalance(userId);
+      const openPositions = db.getOpenPositions(userId);
+
+      let response = `🎮 **Simulation Mode Dashboard**\n\n`;
+
+      response += `💰 **Account Status:**\n`;
+      response += `• Paper Balance: ${balance.toFixed(4)} SOL\n`;
+      response += `• Open Positions: ${openPositions.length}\n\n`;
+
+      response += `📊 **Trade Statistics:**\n`;
+      response += `• Total Trades: ${paperStats?.total_trades || 0}\n`;
+      response += `• Open: ${paperStats?.open_trades || 0}\n`;
+      response += `• Winners: ${paperStats?.winners || 0}\n`;
+      response += `• Losers: ${paperStats?.losers || 0}\n`;
+
+      const winRate = paperStats?.winners && (paperStats.winners + paperStats.losers) > 0
+        ? (paperStats.winners / (paperStats.winners + paperStats.losers) * 100).toFixed(1)
+        : '0';
+      response += `• Win Rate: ${winRate}%\n`;
+      response += `• Avg PnL: ${paperStats?.avg_pnl_percentage?.toFixed(2) || 0}%\n`;
+      response += `• Total PnL: ${paperStats?.total_pnl?.toFixed(4) || 0} SOL\n\n`;
+
+      // Calculate account growth
+      const initialBalance = 100; // Default starting balance
+      const accountValue = balance + openPositions.reduce((sum, p) => sum + (p.amount * p.current_price), 0);
+      const growth = ((accountValue - initialBalance) / initialBalance * 100).toFixed(2);
+
+      response += `📈 **Account Growth:** ${growth}%\n`;
+      response += `💼 **Total Value:** ${accountValue.toFixed(4)} SOL\n`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '📂 Open Positions', callback_data: 'view_positions' },
+            { text: '📜 Trade History', callback_data: 'view_history' },
+          ],
+          [
+            { text: '🔄 Reset Balance', callback_data: 'reset_balance' },
+            { text: '💵 Enable Real Trading', callback_data: 'enable_real' },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown', reply_markup: keyboard });
+    } catch (error) {
+      logger.error('Error in handleSimulation:', error);
+      await this.bot.sendMessage(chatId, '❌ Error loading simulation dashboard.');
+    }
+  }
+
+  private async handleProfits(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Get closed positions to calculate profits
+      const closedPositions = db.getClosedPositions(userId);
+      const paperStats = db.getPaperTradeStats(userId);
+
+      let response = `💰 **Profit & Loss Report**\n\n`;
+
+      // Overall P&L
+      const totalPnl = paperStats?.total_pnl || 0;
+      const pnlEmoji = totalPnl > 0 ? '🟢' : totalPnl < 0 ? '🔴' : '⚪';
+      response += `${pnlEmoji} **Total P&L:** ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL\n\n`;
+
+      // Breakdown by outcome
+      const winners = closedPositions.filter(p => p.pnl > 0);
+      const losers = closedPositions.filter(p => p.pnl <= 0);
+
+      const totalWins = winners.reduce((sum, p) => sum + p.pnl, 0);
+      const totalLosses = Math.abs(losers.reduce((sum, p) => sum + p.pnl, 0));
+
+      response += `📈 **Winners:** ${winners.length} trades (+${totalWins.toFixed(4)} SOL)\n`;
+      response += `📉 **Losers:** ${losers.length} trades (-${totalLosses.toFixed(4)} SOL)\n\n`;
+
+      // Best and worst trades
+      if (closedPositions.length > 0) {
+        const sortedByPnl = [...closedPositions].sort((a, b) => b.pnl_percentage - a.pnl_percentage);
+        const best = sortedByPnl[0];
+        const worst = sortedByPnl[sortedByPnl.length - 1];
+
+        response += `🏆 **Best Trade:** ${best.symbol} (+${best.pnl_percentage?.toFixed(2)}%)\n`;
+        response += `💩 **Worst Trade:** ${worst.symbol} (${worst.pnl_percentage?.toFixed(2)}%)\n\n`;
+      }
+
+      // Profit factor
+      const profitFactor = totalLosses > 0 ? (totalWins / totalLosses).toFixed(2) : 'N/A';
+      response += `📊 **Profit Factor:** ${profitFactor}\n`;
+
+      // Average win/loss
+      const avgWin = winners.length > 0 ? (totalWins / winners.length).toFixed(4) : '0';
+      const avgLoss = losers.length > 0 ? (totalLosses / losers.length).toFixed(4) : '0';
+      response += `• Avg Win: +${avgWin} SOL\n`;
+      response += `• Avg Loss: -${avgLoss} SOL\n`;
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    } catch (error) {
+      logger.error('Error in handleProfits:', error);
+      await this.bot.sendMessage(chatId, '❌ Error loading profit report.');
+    }
+  }
+
+  // ============================================================
+  // WALLET CONNECTION HANDLERS
+  // ============================================================
+
+  private async handleConnectWallet(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Check if user already has a wallet
+      const existingWallet = db.getUserWallet(userId);
+
+      let response = `🔗 **Connect Your Wallet**\n\n`;
+
+      if (existingWallet) {
+        const maskedKey = existingWallet.public_key.substring(0, 6) + '...' + existingWallet.public_key.substring(existingWallet.public_key.length - 4);
+        response += `✅ **Current Wallet:**\n`;
+        response += `\`${maskedKey}\`\n\n`;
+        response += `Choose an option:\n`;
+      } else {
+        response += `You don't have a wallet connected yet.\n\n`;
+        response += `Choose how to connect:\n`;
+      }
+
+      response += `\n🔐 *Security Note:* Your private keys are encrypted with AES-256 and protected by your PIN.`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '➕ Create New Wallet', callback_data: 'wallet_create' },
+          ],
+          [
+            { text: '📥 Import Private Key', callback_data: 'wallet_import' },
+          ],
+          [
+            { text: '🔗 Connect Phantom (Coming Soon)', callback_data: 'wallet_phantom' },
+          ],
+          [
+            { text: '🔗 Connect Solflare (Coming Soon)', callback_data: 'wallet_solflare' },
+          ],
+          existingWallet ? [
+            { text: '🗑️ Remove Wallet', callback_data: 'wallet_remove' },
+          ] : [],
+        ].filter(row => row.length > 0),
+      };
+
+      await this.bot.sendMessage(chatId, response, { parse_mode: 'Markdown', reply_markup: keyboard });
+    } catch (error) {
+      logger.error('Error in handleConnectWallet:', error);
+      await this.bot.sendMessage(chatId, '❌ Error loading wallet options.');
+    }
+  }
+
+  private async handleEnableTrading(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Check if user has a wallet
+      const wallet = db.getUserWallet(userId);
+      if (!wallet) {
+        await this.bot.sendMessage(chatId,
+          `⚠️ **No Wallet Connected**\n\n` +
+          `You need to connect a wallet first before enabling real trading.\n\n` +
+          `Use /connectwallet to set up your wallet.`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Confirm before enabling
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '✅ Yes, Enable Real Trading', callback_data: 'confirm_enable_trading' },
+          ],
+          [
+            { text: '❌ Cancel', callback_data: 'close' },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(chatId,
+        `⚠️ **Enable Real Trading?**\n\n` +
+        `This will allow the bot to execute REAL trades using your connected wallet.\n\n` +
+        `**Risks:**\n` +
+        `• Real funds will be used\n` +
+        `• Trades cannot be undone\n` +
+        `• Market volatility can cause losses\n\n` +
+        `**Safety Features:**\n` +
+        `• Max position size limits\n` +
+        `• Stop loss protection\n` +
+        `• PIN required for transactions\n\n` +
+        `Are you sure you want to enable real trading?`,
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+    } catch (error) {
+      logger.error('Error in handleEnableTrading:', error);
+      await this.bot.sendMessage(chatId, '❌ Error enabling trading.');
+    }
+  }
+
+  private async handleDisableTrading(msg: TelegramBot.Message): Promise<void> {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id || 0;
+
+    try {
+      // Disable real trading
+      db.updateUserSettings(userId, { paperTrading: true });
+
+      await this.bot.sendMessage(chatId,
+        `✅ **Real Trading Disabled**\n\n` +
+        `You are now in Paper Trading mode.\n` +
+        `No real funds will be used for trades.\n\n` +
+        `Use /enabletrading to switch back to real trading.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      logger.error('Error in handleDisableTrading:', error);
+      await this.bot.sendMessage(chatId, '❌ Error disabling trading.');
+    }
+  }
+
   async start(): Promise<void> {
     try {
       // Register bot commands with Telegram
@@ -3724,6 +4068,7 @@ Use /hunt to start hunting!
         { command: 'resetbalance', description: 'Reset paper balance to 100 SOL' },
         { command: 'wallet', description: 'View your trading wallet' },
         { command: 'createwallet', description: 'Create a new trading wallet' },
+        { command: 'connectwallet', description: 'Connect or import a wallet' },
         { command: 'balance', description: 'Check your wallet balance' },
         { command: 'deposit', description: 'Get deposit instructions' },
         { command: 'favorites', description: 'View your favorite tokens' },
@@ -3734,6 +4079,12 @@ Use /hunt to start hunting!
         { command: 'performance', description: 'View strategy performance report' },
         { command: 'tierperformance', description: 'View performance by market cap tier' },
         { command: 'winners', description: 'View recent big winners (5x+)' },
+        { command: 'strategies', description: 'View strategy rankings' },
+        { command: 'createstrategy', description: 'Create a new trading strategy' },
+        { command: 'simulation', description: 'View simulation dashboard' },
+        { command: 'profits', description: 'View profit/loss report' },
+        { command: 'enabletrading', description: 'Enable real trading' },
+        { command: 'disabletrading', description: 'Disable real trading' },
       ]);
 
       logger.info('✅ Bot commands registered with Telegram');

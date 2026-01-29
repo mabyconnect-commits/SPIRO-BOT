@@ -22,6 +22,7 @@ class DatabaseManager {
 
     this.db = new Database(config.database.path);
     this.initialize();
+    this.initializePatternTables();
   }
 
   /**
@@ -1041,6 +1042,16 @@ class DatabaseManager {
     return stmt.get(userId);
   }
 
+  getClosedPositions(userId: number = 0): any[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM positions
+      WHERE user_id = ? AND status = 'closed'
+      ORDER BY closed_at DESC
+    `);
+
+    return stmt.all(userId) as any[];
+  }
+
   // Alpha picks methods
   saveAlphaPick(data: {
     contractAddress: string;
@@ -1196,6 +1207,341 @@ class DatabaseManager {
       paperTrading: r.paper_trading === 1,
       preset: r.preset,
     }));
+  }
+
+  // ============================================================
+  // PATTERN STATUS AND BLACKLIST METHODS
+  // ============================================================
+
+  /**
+   * Initialize pattern status and blacklist tables
+   */
+  initializePatternTables(): void {
+    // Pattern status table for tracking enabled/disabled and weights
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS pattern_status (
+        pattern_id TEXT PRIMARY KEY,
+        pattern_name TEXT NOT NULL,
+        is_enabled INTEGER DEFAULT 1,
+        is_blacklisted INTEGER DEFAULT 0,
+        blacklist_reason TEXT,
+        weight REAL DEFAULT 1.0,
+        win_rate REAL DEFAULT 0.5,
+        avg_return REAL DEFAULT 0,
+        sample_size INTEGER DEFAULT 0,
+        consecutive_losses INTEGER DEFAULT 0,
+        consecutive_wins INTEGER DEFAULT 0,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Blacklisted patterns table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS blacklisted_patterns (
+        pattern_id TEXT PRIMARY KEY,
+        reason TEXT NOT NULL,
+        blacklisted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        redeemed_at DATETIME
+      )
+    `);
+
+    // Strategy performance log table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS strategy_performance_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pattern_id TEXT NOT NULL,
+        win_rate REAL,
+        avg_return REAL,
+        sample_size INTEGER,
+        weight REAL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // System logs table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS system_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        level TEXT NOT NULL,
+        category TEXT NOT NULL,
+        message TEXT NOT NULL,
+        details TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Advanced position configs table (tiered TP, trailing stop)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS advanced_position_configs (
+        position_id TEXT PRIMARY KEY,
+        config TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+  }
+
+  /**
+   * Get pattern status from database
+   */
+  getPatternStatus(patternId: string): any | null {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM pattern_status WHERE pattern_id = ?
+      `);
+      const row = stmt.get(patternId) as any;
+      if (!row) return null;
+
+      return {
+        patternId: row.pattern_id,
+        patternName: row.pattern_name,
+        isEnabled: row.is_enabled === 1,
+        isBlacklisted: row.is_blacklisted === 1,
+        blacklistReason: row.blacklist_reason,
+        weight: row.weight,
+        winRate: row.win_rate,
+        avgReturn: row.avg_return,
+        sampleSize: row.sample_size,
+        consecutiveLosses: row.consecutive_losses,
+        consecutiveWins: row.consecutive_wins,
+        lastUpdated: new Date(row.last_updated),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Save pattern status to database
+   */
+  savePatternStatus(status: any): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO pattern_status (
+        pattern_id, pattern_name, is_enabled, is_blacklisted, blacklist_reason,
+        weight, win_rate, avg_return, sample_size, consecutive_losses,
+        consecutive_wins, last_updated
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      status.patternId,
+      status.patternName,
+      status.isEnabled ? 1 : 0,
+      status.isBlacklisted ? 1 : 0,
+      status.blacklistReason || null,
+      status.weight,
+      status.winRate,
+      status.avgReturn,
+      status.sampleSize,
+      status.consecutiveLosses,
+      status.consecutiveWins,
+      status.lastUpdated.toISOString()
+    );
+
+    // Log strategy performance change
+    this.logStrategyPerformance(status.patternId, status.winRate, status.avgReturn, status.sampleSize, status.weight);
+  }
+
+  /**
+   * Log strategy performance for historical tracking
+   */
+  logStrategyPerformance(patternId: string, winRate: number, avgReturn: number, sampleSize: number, weight: number): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO strategy_performance_log (pattern_id, win_rate, avg_return, sample_size, weight)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    stmt.run(patternId, winRate, avgReturn, sampleSize, weight);
+  }
+
+  /**
+   * Get all pattern statuses
+   */
+  getAllPatternStatuses(): any[] {
+    try {
+      const stmt = this.db.prepare('SELECT * FROM pattern_status ORDER BY weight DESC');
+      return stmt.all() as any[];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Save blacklisted pattern
+   */
+  saveBlacklistedPattern(patternId: string, reason: string): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO blacklisted_patterns (pattern_id, reason, blacklisted_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+    `);
+    stmt.run(patternId, reason);
+
+    // Log the blacklist event
+    this.saveSystemLog('warning', 'pattern_blacklist', `Pattern ${patternId} blacklisted: ${reason}`);
+  }
+
+  /**
+   * Remove pattern from blacklist
+   */
+  removeBlacklistedPattern(patternId: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE blacklisted_patterns
+      SET redeemed_at = CURRENT_TIMESTAMP
+      WHERE pattern_id = ?
+    `);
+    stmt.run(patternId);
+
+    // Log the redemption event
+    this.saveSystemLog('info', 'pattern_redemption', `Pattern ${patternId} redeemed from blacklist`);
+  }
+
+  /**
+   * Get all currently blacklisted patterns
+   */
+  getBlacklistedPatterns(): any[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM blacklisted_patterns
+        WHERE redeemed_at IS NULL
+        ORDER BY blacklisted_at DESC
+      `);
+      return stmt.all() as any[];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get strategy performance history
+   */
+  getStrategyPerformanceHistory(patternId: string, limit: number = 100): any[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM strategy_performance_log
+        WHERE pattern_id = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(patternId, limit) as any[];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Save system log entry
+   */
+  saveSystemLog(level: string, category: string, message: string, details?: any): void {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO system_logs (level, category, message, details)
+        VALUES (?, ?, ?, ?)
+      `);
+      stmt.run(level, category, message, details ? JSON.stringify(details) : null);
+    } catch (error) {
+      // Silently fail - don't let logging failures break the app
+      console.error('Failed to save system log:', error);
+    }
+  }
+
+  /**
+   * Get system logs
+   */
+  getSystemLogs(category?: string, limit: number = 100): any[] {
+    try {
+      let query = 'SELECT * FROM system_logs';
+      const params: any[] = [];
+
+      if (category) {
+        query += ' WHERE category = ?';
+        params.push(category);
+      }
+
+      query += ' ORDER BY timestamp DESC LIMIT ?';
+      params.push(limit);
+
+      const stmt = this.db.prepare(query);
+      return stmt.all(...params) as any[];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get strategy rankings by profitability
+   */
+  getStrategyRankings(): any[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT
+          ps.pattern_id,
+          ps.pattern_name,
+          ps.is_enabled,
+          ps.is_blacklisted,
+          ps.weight,
+          ps.win_rate,
+          ps.avg_return,
+          ps.sample_size,
+          (ps.win_rate * ps.avg_return) as risk_adjusted_return,
+          (ps.avg_return * ps.sample_size) as total_profit
+        FROM pattern_status ps
+        WHERE ps.sample_size >= 5
+        ORDER BY total_profit DESC
+      `);
+      return stmt.all() as any[];
+    } catch {
+      return [];
+    }
+  }
+
+  // ============================================================
+  // ADVANCED POSITION CONFIG METHODS (Tiered TP, Trailing Stop)
+  // ============================================================
+
+  /**
+   * Save advanced position config
+   */
+  saveAdvancedPositionConfig(positionId: string, config: string): void {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO advanced_position_configs (position_id, config, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+    `);
+    stmt.run(positionId, config);
+  }
+
+  /**
+   * Get advanced position config
+   */
+  getAdvancedPositionConfig(positionId: string): any | null {
+    try {
+      const stmt = this.db.prepare('SELECT * FROM advanced_position_configs WHERE position_id = ?');
+      return stmt.get(positionId) as any;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Get all advanced position configs
+   */
+  getAdvancedPositionConfigs(): any[] {
+    try {
+      const stmt = this.db.prepare('SELECT * FROM advanced_position_configs');
+      return stmt.all() as any[];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Delete advanced position config
+   */
+  deleteAdvancedPositionConfig(positionId: string): void {
+    try {
+      const stmt = this.db.prepare('DELETE FROM advanced_position_configs WHERE position_id = ?');
+      stmt.run(positionId);
+    } catch {
+      // Ignore errors
+    }
   }
 
   close(): void {
