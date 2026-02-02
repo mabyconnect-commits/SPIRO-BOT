@@ -132,16 +132,88 @@ export class DexScreenerClient {
   }
 
   /**
-   * Get new pairs from specific DEXs (launchpads)
+   * Get new pairs from launchpads by searching for launchpad-related tokens
+   * Since DexScreener doesn't have a bulk "get all pairs" endpoint,
+   * we use the search API with launchpad keywords
    */
   async getNewPairs(): Promise<any[]> {
+    const allPairs: any[] = [];
+    const seenAddresses = new Set<string>();
+
+    // Search for tokens from different launchpads
+    const launchpadSearches = [
+      'pumpfun',
+      'pump.fun',
+      'meteora',
+      'raydium',
+      'moonshot',
+    ];
+
+    // Also search for trending/new token indicators
+    const trendingSearches = [
+      'solana new',
+      'sol meme',
+    ];
+
+    const allSearches = [...launchpadSearches, ...trendingSearches];
+
+    for (const query of allSearches) {
+      try {
+        const pairs = await this.searchPairs(query);
+
+        // Add unique pairs (by base token address)
+        for (const pair of pairs) {
+          const address = pair.baseToken?.address;
+          if (address && !seenAddresses.has(address)) {
+            // Only include Solana pairs
+            if (pair.chainId === 'solana') {
+              seenAddresses.add(address);
+              allPairs.push(pair);
+            }
+          }
+        }
+
+        // Small delay to avoid rate limits
+        await sleep(200);
+      } catch (error) {
+        logger.warn(`Search for "${query}" failed:`, error);
+      }
+    }
+
+    logger.info(`DexScreener.getNewPairs: Found ${allPairs.length} unique Solana pairs from searches`);
+    return allPairs;
+  }
+
+  /**
+   * Get latest token profiles (tokens that have been updated/boosted recently)
+   */
+  async getLatestTokenProfiles(): Promise<any[]> {
     const result = await withRetry(async () => {
       const response = await axios.get(
-        `${this.baseUrl}/pairs/solana`,
+        'https://api.dexscreener.com/token-profiles/latest/v1',
         { timeout: API_TIMEOUT }
       );
-      return response.data.pairs || [];
-    }, 'DexScreener.getNewPairs');
+      // Filter for Solana tokens
+      const profiles = response.data || [];
+      return profiles.filter((p: any) => p.chainId === 'solana');
+    }, 'DexScreener.getLatestTokenProfiles');
+
+    return result || [];
+  }
+
+  /**
+   * Get boosted tokens (tokens with active boosts)
+   */
+  async getTokenBoosts(): Promise<any[]> {
+    const result = await withRetry(async () => {
+      const response = await axios.get(
+        'https://api.dexscreener.com/token-boosts/latest/v1',
+        { timeout: API_TIMEOUT }
+      );
+      // Filter for Solana tokens
+      const boosts = response.data || [];
+      return boosts.filter((b: any) => b.chainId === 'solana');
+    }, 'DexScreener.getTokenBoosts');
 
     return result || [];
   }

@@ -260,34 +260,63 @@ export class TokenScanner {
   private async getTrendingTokens(): Promise<string[]> {
     const tokens: string[] = [];
     const tierCounts = { lowCap: 0, midCap: 0, highCap: 0 };
+    const seenAddresses = new Set<string>();
 
     try {
       logger.info('🚀 Scanning launchpad tokens (PumpFun, Meteora, etc.)...');
       logger.info(`   Market cap filters: Low($${config.scanner.marketCapFilters.lowCap.minMarketCapUsd/1000}k-$${config.scanner.marketCapFilters.lowCap.maxMarketCapUsd/1000}k) | Mid($${config.scanner.marketCapFilters.midCap.minMarketCapUsd/1000}k-$${config.scanner.marketCapFilters.midCap.maxMarketCapUsd/1000000}M) | High($${config.scanner.marketCapFilters.highCap.minMarketCapUsd/1000000}M+)`);
 
-      // Get new pairs from Solana
+      // Get pairs from searches (getNewPairs now uses search API with multiple queries)
       const allPairs = await dexScreener.getNewPairs();
-      logger.info(`Found ${allPairs.length} total pairs`);
+      logger.info(`Found ${allPairs.length} total pairs from search`);
 
       // Filter for launchpad tokens only
       const launchpadPairs = allPairs.filter(pair => dexScreener.isFromLaunchpad(pair));
       logger.info(`Filtered to ${launchpadPairs.length} launchpad tokens`);
 
-      // Also search for specific launchpad keywords
-      const searches = ['pump', 'pumpfun', 'meteora'];
-      for (const query of searches) {
-        const pairs = await dexScreener.searchPairs(query);
+      // If we got very few results, also try token profiles and boosts as fallback
+      if (launchpadPairs.length < 5) {
+        logger.info('Few launchpad pairs found, trying token profiles and boosts...');
 
-        for (const pair of pairs) {
-          if (dexScreener.isFromLaunchpad(pair)) {
-            launchpadPairs.push(pair);
+        try {
+          const tokenProfiles = await dexScreener.getLatestTokenProfiles();
+          for (const profile of tokenProfiles) {
+            if (profile.tokenAddress && !seenAddresses.has(profile.tokenAddress)) {
+              // Get full pair data for this token
+              const tokenData = await dexScreener.getTokenData(profile.tokenAddress);
+              if (tokenData && dexScreener.isFromLaunchpad(tokenData)) {
+                launchpadPairs.push(tokenData);
+                seenAddresses.add(profile.tokenAddress);
+              }
+              await this.sleep(100); // Small delay
+            }
           }
+        } catch (error) {
+          logger.debug('Token profiles fetch failed, continuing with available data');
+        }
+
+        try {
+          const tokenBoosts = await dexScreener.getTokenBoosts();
+          for (const boost of tokenBoosts) {
+            if (boost.tokenAddress && !seenAddresses.has(boost.tokenAddress)) {
+              const tokenData = await dexScreener.getTokenData(boost.tokenAddress);
+              if (tokenData && dexScreener.isFromLaunchpad(tokenData)) {
+                launchpadPairs.push(tokenData);
+                seenAddresses.add(boost.tokenAddress);
+              }
+              await this.sleep(100);
+            }
+          }
+        } catch (error) {
+          logger.debug('Token boosts fetch failed, continuing with available data');
         }
       }
 
       // Process launchpad pairs with market cap filtering
       for (const pair of launchpadPairs) {
         if (!pair.baseToken?.address) continue;
+        if (seenAddresses.has(pair.baseToken.address)) continue;
+        seenAddresses.add(pair.baseToken.address);
 
         const volume24h = parseFloat(pair.volume?.h24 || '0');
         const liquidity = parseFloat(pair.liquidity?.usd || '0');
@@ -297,19 +326,23 @@ export class TokenScanner {
         const { passes, tier } = passesMarketCapFilter(marketCap, liquidity);
 
         if (!passes) {
-          continue; // Skip tokens outside configured market cap tiers
+          // Log why it was skipped for debugging
+          logger.debug(`Skipped ${pair.baseToken.symbol || 'unknown'}: MC $${marketCap} outside filters`);
+          continue;
         }
 
-        // Check volume requirement (reduced for low cap, standard for others)
-        const volumeMultiplier = tier === 'lowCap' ? 0.3 : (tier === 'midCap' ? 0.5 : 1.0);
-        if (volume24h < config.scanner.minVolume24hUsd * volumeMultiplier) {
+        // Relaxed volume requirement for very new/small tokens
+        // Low cap: $1k min volume, Mid cap: $5k min volume, High cap: $10k min volume
+        const minVolume = tier === 'lowCap' ? 1000 : (tier === 'midCap' ? 5000 : 10000);
+        if (volume24h < minVolume) {
+          logger.debug(`Skipped ${pair.baseToken.symbol || 'unknown'}: Volume $${volume24h} below min $${minVolume}`);
           continue;
         }
 
         tokens.push(pair.baseToken.address);
         if (tier) tierCounts[tier]++;
 
-        logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} [${tier?.toUpperCase()}] MC: $${(marketCap/1000).toFixed(1)}k | Liq: $${(liquidity/1000).toFixed(1)}k`);
+        logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} [${tier?.toUpperCase()}] MC: $${(marketCap/1000).toFixed(1)}k | Liq: $${(liquidity/1000).toFixed(1)}k | Vol: $${(volume24h/1000).toFixed(1)}k`);
       }
     } catch (error) {
       logger.error('Error fetching launchpad tokens:', error);
