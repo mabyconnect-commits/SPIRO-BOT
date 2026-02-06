@@ -132,18 +132,96 @@ export class DexScreenerClient {
   }
 
   /**
-   * Get new pairs from specific DEXs (launchpads)
+   * Get new pairs from Solana using multiple discovery strategies
    */
   async getNewPairs(): Promise<any[]> {
-    const result = await withRetry(async () => {
-      const response = await axios.get(
-        `${this.baseUrl}/pairs/solana`,
-        { timeout: API_TIMEOUT }
-      );
-      return response.data.pairs || [];
-    }, 'DexScreener.getNewPairs');
+    const allPairs: any[] = [];
 
-    return result || [];
+    // Strategy 1: Get latest boosted tokens (trending/promoted)
+    try {
+      const boostResult = await withRetry(async () => {
+        const response = await axios.get(
+          'https://api.dexscreener.com/token-boosts/latest/v1',
+          { timeout: API_TIMEOUT }
+        );
+        return response.data;
+      }, 'DexScreener.getLatestBoostedTokens');
+
+      if (boostResult && Array.isArray(boostResult)) {
+        const solanaTokens = boostResult
+          .filter((t: any) => t.chainId === 'solana')
+          .slice(0, 30);
+
+        for (const token of solanaTokens) {
+          if (token.tokenAddress) {
+            const pairData = await this.getTokenData(token.tokenAddress);
+            if (pairData) {
+              allPairs.push(pairData);
+            }
+            await sleep(300);
+          }
+        }
+        logger.info(`🔄 Fetched ${solanaTokens.length} boosted Solana tokens`);
+      }
+    } catch (error) {
+      logger.debug('Error fetching boosted tokens:', error);
+    }
+
+    // Strategy 2: Get latest token profiles (newly listed)
+    try {
+      const profileResult = await withRetry(async () => {
+        const response = await axios.get(
+          'https://api.dexscreener.com/token-profiles/latest/v1',
+          { timeout: API_TIMEOUT }
+        );
+        return response.data;
+      }, 'DexScreener.getLatestTokenProfiles');
+
+      if (profileResult && Array.isArray(profileResult)) {
+        const solanaTokens = profileResult
+          .filter((t: any) => t.chainId === 'solana')
+          .slice(0, 20);
+
+        for (const token of solanaTokens) {
+          if (token.tokenAddress) {
+            const pairData = await this.getTokenData(token.tokenAddress);
+            if (pairData) {
+              allPairs.push(pairData);
+            }
+            await sleep(300);
+          }
+        }
+        logger.info(`🔄 Fetched ${solanaTokens.length} profiled Solana tokens`);
+      }
+    } catch (error) {
+      logger.debug('Error fetching token profiles:', error);
+    }
+
+    // Strategy 3: Search for Solana launchpad pairs
+    const searchQueries = ['solana new', 'pump sol', 'raydium sol', 'meteora'];
+    for (const query of searchQueries) {
+      try {
+        const pairs = await this.searchPairs(query);
+        const solanaPairs = pairs.filter((p: any) => p.chainId === 'solana');
+        allPairs.push(...solanaPairs);
+        logger.debug(`Search "${query}" found ${solanaPairs.length} Solana pairs`);
+      } catch (error) {
+        logger.debug(`Error searching "${query}":`, error);
+      }
+      await sleep(500);
+    }
+
+    // Deduplicate by base token address
+    const seen = new Set<string>();
+    const uniquePairs = allPairs.filter(p => {
+      const addr = p.baseToken?.address;
+      if (!addr || seen.has(addr)) return false;
+      seen.add(addr);
+      return true;
+    });
+
+    logger.info(`📊 DexScreener: Found ${uniquePairs.length} unique Solana pairs total`);
+    return uniquePairs;
   }
 
   /**
@@ -161,14 +239,21 @@ export class DexScreenerClient {
    */
   isFromLaunchpad(pair: any): boolean {
     const dexId = pair.dexId?.toLowerCase() || '';
+    const labels = (pair.labels || []).map((l: string) => l.toLowerCase());
     const launchpads = [
       'pump',      // PumpFun
       'meteora',   // Meteora
       'raydium',   // Raydium (has launchpad)
       'moonshot',  // Moonshot
       'pump.fun',  // PumpFun alternative name
+      'orca',      // Orca DEX
+      'lifinity',  // Lifinity
     ];
-    return launchpads.some(lp => dexId.includes(lp));
+    // Check dexId or labels for launchpad indicators
+    const matchesDex = launchpads.some(lp => dexId.includes(lp));
+    const matchesLabel = labels.some((l: string) => launchpads.some(lp => l.includes(lp)));
+    // Also consider any Solana pair as potentially valid
+    return matchesDex || matchesLabel || pair.chainId === 'solana';
   }
 }
 
@@ -577,12 +662,35 @@ export class JupiterClient {
 
   async getTokenPrice(mintAddress: string): Promise<number | null> {
     return withRetry(async () => {
-      const response = await axios.get(
-        `https://price.jup.ag/v4/price?ids=${mintAddress}`,
-        { timeout: API_TIMEOUT }
-      );
-      const price = response.data.data?.[mintAddress]?.price;
-      return price !== undefined ? price : null;
+      // Try Jupiter v2 price API first
+      try {
+        const response = await axios.get(
+          `https://api.jup.ag/price/v2?ids=${mintAddress}`,
+          { timeout: API_TIMEOUT }
+        );
+        const price = response.data.data?.[mintAddress]?.price;
+        if (price !== undefined && price !== null) {
+          return parseFloat(price);
+        }
+      } catch (error) {
+        logger.debug('Jupiter v2 price API failed, trying DexScreener fallback');
+      }
+
+      // Fallback: Use DexScreener for price
+      try {
+        const response = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`,
+          { timeout: API_TIMEOUT }
+        );
+        const pair = response.data.pairs?.[0];
+        if (pair?.priceUsd) {
+          return parseFloat(pair.priceUsd);
+        }
+      } catch (error) {
+        logger.debug('DexScreener price fallback also failed');
+      }
+
+      return null;
     }, `Jupiter.getTokenPrice(${mintAddress.substring(0, 8)}...)`);
   }
 }

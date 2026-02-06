@@ -555,7 +555,7 @@ class DatabaseManager {
     positionId: string;
     contractAddress: string;
     symbol: string;
-    action: 'buy' | 'sell';
+    action: 'buy' | 'sell' | 'partial_sell';
     amountSol: number;
     tokenAmount: number;
     price: number;

@@ -3837,7 +3837,7 @@ Use /hunt to start hunting!
 
       // Calculate account growth
       const initialBalance = 100; // Default starting balance
-      const accountValue = balance + openPositions.reduce((sum, p) => sum + (p.amount * p.current_price), 0);
+      const accountValue = balance + openPositions.reduce((sum, p) => sum + (p.amount * p.currentPrice), 0);
       const growth = ((accountValue - initialBalance) / initialBalance * 100).toFixed(2);
 
       response += `📈 **Account Growth:** ${growth}%\n`;
@@ -3931,7 +3931,7 @@ Use /hunt to start hunting!
       let response = `🔗 **Connect Your Wallet**\n\n`;
 
       if (existingWallet) {
-        const maskedKey = existingWallet.public_key.substring(0, 6) + '...' + existingWallet.public_key.substring(existingWallet.public_key.length - 4);
+        const maskedKey = existingWallet.publicKey.substring(0, 6) + '...' + existingWallet.publicKey.substring(existingWallet.publicKey.length - 4);
         response += `✅ **Current Wallet:**\n`;
         response += `\`${maskedKey}\`\n\n`;
         response += `Choose an option:\n`;

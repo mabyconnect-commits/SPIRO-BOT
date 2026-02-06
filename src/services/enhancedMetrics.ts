@@ -97,16 +97,16 @@ class EnhancedMetricsService {
     };
 
     try {
-      // Get holder data from Helius to identify dev wallet
-      const holderAnalysis = await helius.analyzeHolders(contractAddress);
+      // Get holder distribution from Helius to identify dev wallet
+      const holderDistribution = await helius.getHolderDistribution(contractAddress, 50);
 
-      if (!holderAnalysis || !holderAnalysis.distribution.topHolders.length) {
+      if (!holderDistribution || !holderDistribution.topHolders.length) {
         return defaultBehavior;
       }
 
       // Typically, dev wallet is one of the top holders (often #1 or #2)
       // Look for wallets with >5% that aren't liquidity pools
-      const topHolders = holderAnalysis.distribution.topHolders;
+      const topHolders = holderDistribution.topHolders;
       const potentialDevWallet = topHolders.find(h =>
         h.percentage > 5 && h.percentage < 50 // Between 5-50% is suspicious dev wallet range
       );
@@ -119,27 +119,23 @@ class EnhancedMetricsService {
       const devAddress = potentialDevWallet.address;
       const percentage = potentialDevWallet.percentage;
 
-      // Check recent changes for this wallet
-      const recentChanges = holderAnalysis.recentChanges.filter(c => c.address === devAddress);
-      const recentSells = recentChanges.filter(c => c.action === 'sell').length;
-      const lastChange = recentChanges[0];
+      // Check holder changes for accumulation/distribution signals
+      const holderChanges = await helius.detectHolderChanges(contractAddress);
+      const distributingDev = holderChanges?.distributingAddresses.find(c => c.address === devAddress);
+      const recentSells = distributingDev ? 1 : 0;
 
-      // Calculate sell pressure (0-1)
+      // Calculate sell pressure from distribution signals (0-1)
       let sellPressure = 0;
-      if (recentChanges.length > 0) {
-        const totalSold = recentChanges
-          .filter(c => c.action === 'sell')
-          .reduce((sum, c) => sum + Math.abs(c.changeAmount), 0);
-        sellPressure = Math.min(1, totalSold / (potentialDevWallet.balance + totalSold));
+      if (distributingDev) {
+        sellPressure = Math.min(1, Math.abs(distributingDev.changePercent) / 100);
       }
 
-      // Check for dumping behavior (selling >10% of holdings in 24h)
+      // Check for dumping behavior (selling >10% of holdings)
       const isDumping = sellPressure > 0.1;
 
       // Check for suspicious patterns
       const suspiciousActivity =
         sellPressure > 0.3 || // Selling >30% is very suspicious
-        (recentSells > 5 && sellPressure > 0.15) || // Many sells
         percentage > 30; // >30% concentration is risky
 
       return {
@@ -148,8 +144,8 @@ class EnhancedMetricsService {
         percentageOfSupply: percentage,
         recentSells,
         sellPressure,
-        lastActivity: lastChange?.timestamp || null,
-        isActive: recentChanges.length > 0,
+        lastActivity: null,
+        isActive: holderChanges?.overallTrend !== 'neutral',
         isDumping,
         holdingDuration: 0, // Would need historical data to calculate
         suspiciousActivity,

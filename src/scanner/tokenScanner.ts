@@ -259,34 +259,45 @@ export class TokenScanner {
    */
   private async getTrendingTokens(): Promise<string[]> {
     const tokens: string[] = [];
-    const tierCounts = { lowCap: 0, midCap: 0, highCap: 0 };
+    const tierCounts = { lowCap: 0, midCap: 0, highCap: 0, unfiltered: 0 };
 
     try {
       logger.info('🚀 Scanning launchpad tokens (PumpFun, Meteora, etc.)...');
       logger.info(`   Market cap filters: Low($${config.scanner.marketCapFilters.lowCap.minMarketCapUsd/1000}k-$${config.scanner.marketCapFilters.lowCap.maxMarketCapUsd/1000}k) | Mid($${config.scanner.marketCapFilters.midCap.minMarketCapUsd/1000}k-$${config.scanner.marketCapFilters.midCap.maxMarketCapUsd/1000000}M) | High($${config.scanner.marketCapFilters.highCap.minMarketCapUsd/1000000}M+)`);
 
-      // Get new pairs from Solana
+      // Get new pairs from Solana (uses boosted tokens, profiles, and search)
       const allPairs = await dexScreener.getNewPairs();
-      logger.info(`Found ${allPairs.length} total pairs`);
+      logger.info(`Found ${allPairs.length} total pairs from DexScreener`);
 
-      // Filter for launchpad tokens only
-      const launchpadPairs = allPairs.filter(pair => dexScreener.isFromLaunchpad(pair));
-      logger.info(`Filtered to ${launchpadPairs.length} launchpad tokens`);
+      // Accept all Solana pairs (isFromLaunchpad now includes all Solana pairs)
+      const candidatePairs = allPairs.filter(pair => dexScreener.isFromLaunchpad(pair));
+      logger.info(`Filtered to ${candidatePairs.length} candidate pairs`);
 
-      // Also search for specific launchpad keywords
+      // Also search for specific launchpad keywords for extra coverage
       const searches = ['pump', 'pumpfun', 'meteora'];
       for (const query of searches) {
-        const pairs = await dexScreener.searchPairs(query);
-
-        for (const pair of pairs) {
-          if (dexScreener.isFromLaunchpad(pair)) {
-            launchpadPairs.push(pair);
-          }
+        try {
+          const pairs = await dexScreener.searchPairs(query);
+          const solanaPairs = pairs.filter((p: any) => p.chainId === 'solana');
+          candidatePairs.push(...solanaPairs);
+        } catch (error) {
+          logger.debug(`Error searching for ${query}:`, error);
         }
       }
 
-      // Process launchpad pairs with market cap filtering
-      for (const pair of launchpadPairs) {
+      // Deduplicate candidate pairs
+      const seen = new Set<string>();
+      const uniqueCandidates = candidatePairs.filter(pair => {
+        const addr = pair.baseToken?.address;
+        if (!addr || seen.has(addr)) return false;
+        seen.add(addr);
+        return true;
+      });
+
+      logger.info(`Processing ${uniqueCandidates.length} unique candidate pairs...`);
+
+      // Process pairs with market cap filtering
+      for (const pair of uniqueCandidates) {
         if (!pair.baseToken?.address) continue;
 
         const volume24h = parseFloat(pair.volume?.h24 || '0');
@@ -296,20 +307,24 @@ export class TokenScanner {
         // Check if token passes market cap filters
         const { passes, tier } = passesMarketCapFilter(marketCap, liquidity);
 
-        if (!passes) {
-          continue; // Skip tokens outside configured market cap tiers
+        if (passes) {
+          // Check volume requirement (reduced for low cap, standard for others)
+          const volumeMultiplier = tier === 'lowCap' ? 0.1 : (tier === 'midCap' ? 0.3 : 0.5);
+          if (volume24h >= config.scanner.minVolume24hUsd * volumeMultiplier) {
+            tokens.push(pair.baseToken.address);
+            if (tier) tierCounts[tier]++;
+            logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} [${tier?.toUpperCase()}] MC: $${(marketCap/1000).toFixed(1)}k | Liq: $${(liquidity/1000).toFixed(1)}k | Vol: $${(volume24h/1000).toFixed(1)}k`);
+            continue;
+          }
         }
 
-        // Check volume requirement (reduced for low cap, standard for others)
-        const volumeMultiplier = tier === 'lowCap' ? 0.3 : (tier === 'midCap' ? 0.5 : 1.0);
-        if (volume24h < config.scanner.minVolume24hUsd * volumeMultiplier) {
-          continue;
+        // Fallback: Include tokens with minimal liquidity even if they don't match market cap tiers
+        // This ensures we still scan tokens when strict filters are too aggressive
+        if (liquidity >= 1000 && marketCap >= 1000) {
+          tokens.push(pair.baseToken.address);
+          tierCounts.unfiltered++;
+          logger.info(`📋 Added ${pair.baseToken.symbol || 'token'} [UNFILTERED] MC: $${(marketCap/1000).toFixed(1)}k | Liq: $${(liquidity/1000).toFixed(1)}k`);
         }
-
-        tokens.push(pair.baseToken.address);
-        if (tier) tierCounts[tier]++;
-
-        logger.info(`✅ Added ${pair.baseToken.symbol || 'token'} [${tier?.toUpperCase()}] MC: $${(marketCap/1000).toFixed(1)}k | Liq: $${(liquidity/1000).toFixed(1)}k`);
       }
     } catch (error) {
       logger.error('Error fetching launchpad tokens:', error);
@@ -317,7 +332,7 @@ export class TokenScanner {
 
     // Remove duplicates
     const uniqueTokens = [...new Set(tokens)];
-    logger.info(`📊 Final count: ${uniqueTokens.length} unique tokens (Low: ${tierCounts.lowCap}, Mid: ${tierCounts.midCap}, High: ${tierCounts.highCap})`);
+    logger.info(`📊 Final count: ${uniqueTokens.length} unique tokens (Low: ${tierCounts.lowCap}, Mid: ${tierCounts.midCap}, High: ${tierCounts.highCap}, Unfiltered: ${tierCounts.unfiltered})`);
     return uniqueTokens;
   }
 
