@@ -9,9 +9,52 @@ import { riskManager } from './risk/riskManager';
 import { analyticsEngine } from './analytics/analyticsEngine';
 import { mlEngine } from './ml/mlStrategyEngine';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
+
+// PID file to prevent multiple instances
+const PID_FILE = path.join(__dirname, '..', 'data', 'bot.pid');
+
+function checkAndWritePid(): void {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf-8').trim());
+      if (oldPid && !isNaN(oldPid)) {
+        try {
+          // Check if old process is still alive
+          process.kill(oldPid, 0);
+          // It's alive — kill it
+          logger.info(`Killing old bot instance (PID ${oldPid})...`);
+          process.kill(oldPid, 'SIGKILL');
+        } catch {
+          // Process doesn't exist — stale pid file
+        }
+      }
+    }
+    fs.writeFileSync(PID_FILE, String(process.pid));
+  } catch (err) {
+    logger.warn('Could not manage PID file:', err);
+  }
+}
+
+function cleanupPid(): void {
+  try { fs.unlinkSync(PID_FILE); } catch {}
+}
+
+// Prevent unhandled rejections from crashing the bot
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  // Don't exit — keep the bot running
+});
 
 async function main() {
   try {
+    // Kill any old instance before starting
+    checkAndWritePid();
     logger.info('🚀 Alpha Hunter starting up...');
 
     // Validate configuration
@@ -44,6 +87,13 @@ async function main() {
       }
     });
 
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        logger.warn(`⚠️ Port ${PORT} in use, health check server skipped`);
+      } else {
+        logger.error('Health check server error:', err);
+      }
+    });
     server.listen(PORT, () => {
       logger.info(`🌐 Health check server listening on port ${PORT}`);
     });
@@ -90,6 +140,7 @@ main().then((srv) => {
 // Handle graceful shutdown
 function gracefulShutdown() {
   logger.info('Shutting down gracefully...');
+  cleanupPid();
   tokenScanner.stop();
   pipeline.stopServices();
   if (server) {

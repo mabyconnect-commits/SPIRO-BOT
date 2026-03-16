@@ -133,17 +133,67 @@ export class DexScreenerClient {
 
   /**
    * Get new pairs from specific DEXs (launchpads)
+   * Uses DexScreener token-boosts endpoint for latest activity,
+   * then fetches pair data for each token
    */
   async getNewPairs(): Promise<any[]> {
     const result = await withRetry(async () => {
-      const response = await axios.get(
-        `${this.baseUrl}/pairs/solana`,
+      // Use the token boosts/latest endpoint to find active new tokens
+      const boostsResponse = await axios.get(
+        'https://api.dexscreener.com/token-boosts/latest/v1',
         { timeout: API_TIMEOUT }
       );
-      return response.data.pairs || [];
+      
+      // Filter for Solana tokens only
+      const solanaTokens = (boostsResponse.data || [])
+        .filter((t: any) => t.chainId === 'solana')
+        .slice(0, 30); // Limit to 30 to avoid rate limiting
+      
+      if (solanaTokens.length === 0) {
+        // Fallback: search for recent Solana pairs via search
+        const searchResponse = await axios.get(
+          `${this.baseUrl}/search?q=solana`,
+          { timeout: API_TIMEOUT }
+        );
+        return (searchResponse.data?.pairs || []).filter((p: any) => p.chainId === 'solana');
+      }
+      
+      // Fetch pair data for these tokens in batches
+      const pairs: any[] = [];
+      const batchSize = 10;
+      for (let i = 0; i < solanaTokens.length; i += batchSize) {
+        const batch = solanaTokens.slice(i, i + batchSize);
+        const addresses = batch.map((t: any) => t.tokenAddress).join(',');
+        try {
+          const pairResponse = await axios.get(
+            `${this.baseUrl}/tokens/${addresses}`,
+            { timeout: API_TIMEOUT }
+          );
+          if (pairResponse.data?.pairs) {
+            pairs.push(...pairResponse.data.pairs);
+          }
+        } catch (e) {
+          // Skip failed batches
+        }
+      }
+      
+      return pairs;
     }, 'DexScreener.getNewPairs');
 
     return result || [];
+  }
+
+  /**
+   * Get current price for a token from DexScreener
+   */
+  async getTokenPrice(contractAddress: string): Promise<number | null> {
+    try {
+      const pair = await this.getTokenData(contractAddress);
+      if (!pair || !pair.priceUsd) return null;
+      return parseFloat(pair.priceUsd);
+    } catch (error) {
+      return null;
+    }
   }
 
   /**

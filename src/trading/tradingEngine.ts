@@ -1,7 +1,7 @@
 import { Connection, Keypair, PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
 import { config, TRADING_PRESETS } from '../config';
 import { TradePosition, TradingPreset, AnalysisResult } from '../types';
-import { jupiter } from '../services/apiClients';
+import { jupiter, dexScreener } from '../services/apiClients';
 import db from '../database';
 import logger from '../utils/logger';
 import bs58 from 'bs58';
@@ -308,7 +308,7 @@ export class TradingEngine {
       positionId: position.id,
       contractAddress: position.contractAddress,
       symbol: position.symbol,
-      action: 'partial_sell',
+      action: 'sell' as const, // partial sell recorded as sell type
       amountSol: soldValue,
       tokenAmount: sellAmount,
       price: position.currentPrice,
@@ -855,20 +855,30 @@ export class TradingEngine {
    */
   async updatePosition(position: TradePosition): Promise<TradePosition> {
     try {
-      const currentPrice = await jupiter.getTokenPrice(position.contractAddress);
+      // Try DexScreener first (works for PumpFun/micro-cap tokens)
+      let currentPrice = await dexScreener.getTokenPrice(position.contractAddress);
+
+      // Fallback to Jupiter if DexScreener fails
+      if (currentPrice === null || currentPrice <= 0) {
+        currentPrice = await jupiter.getTokenPrice(position.contractAddress);
+      }
 
       if (currentPrice !== null && currentPrice > 0) {
         position.currentPrice = currentPrice;
 
-        const currentValue = position.amount * currentPrice;
-        const investedValue = position.solInvested;
-
-        position.pnl = currentValue - investedValue;
-        position.pnlPercentage = ((currentValue - investedValue) / investedValue) * 100;
+        // PnL calculation: compare current token value in SOL terms
+        // entryPrice is in USD, so we need consistent units
+        // For paper trades: pnl = (currentPrice - entryPrice) / entryPrice * solInvested
+        if (position.entryPrice > 0) {
+          const priceChangeRatio = (currentPrice - position.entryPrice) / position.entryPrice;
+          position.pnl = priceChangeRatio * position.solInvested;
+          position.pnlPercentage = priceChangeRatio * 100;
+        }
 
         db.savePosition(position);
-      } else if (currentPrice === null) {
-        logger.warn(`Could not fetch price for position ${position.symbol} (${position.contractAddress})`);
+        logger.debug(`Updated ${position.symbol}: $${position.entryPrice.toFixed(8)} → $${currentPrice.toFixed(8)} (${position.pnlPercentage.toFixed(1)}%)`);
+      } else {
+        logger.warn(`Could not fetch price for ${position.symbol} (${position.contractAddress.substring(0, 12)}...)`);
       }
 
       return position;

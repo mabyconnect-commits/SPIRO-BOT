@@ -10,6 +10,7 @@ import walletManager from '../services/walletManager';
 import subscriptionManager from '../services/subscriptionManager';
 import logger from '../utils/logger';
 import { AnalysisResult } from '../types';
+import bs58 from 'bs58';
 
 // Helper to format analysis errors for users
 function formatAnalysisError(error: AnalysisError | undefined): string {
@@ -1805,35 +1806,18 @@ Use /balance to refresh balance
         return;
       }
 
-      // Get the private key
-      const keypair = walletManager.getKeypair(userId);
-      if (!keypair) {
-        throw new Error('Failed to retrieve wallet keypair');
-      }
-
-      const privateKeyArray = Array.from(keypair.secretKey);
-      const privateKeyString = JSON.stringify(privateKeyArray);
-
       const message = `
 ✅ *Wallet Created Successfully!*
 
 *Public Address:*
 \`${result.publicKey}\`
 
-🔑 *Private Key:*
-\`${privateKeyString}\`
+💰 *To start trading:*
+1. Set up a 4-digit PIN for protection
+2. Send SOL to the address above
+3. Start trading!
 
-⚠️ *IMPORTANT SECURITY NOTICE:*
-• Save your private key in a secure location
-• Never share your private key with anyone
-• You need this to recover your wallet
-• Delete this message after saving
-
-*Next Steps:*
-1. Save your private key securely
-2. Set up a 4-digit PIN for protection (recommended)
-3. Fund your wallet with SOL
-4. Start trading!
+🔑 Use /exportkey to view your private key (requires PIN)
       `;
 
       await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
@@ -2036,31 +2020,21 @@ Send SOL to this address:
       const privateKeyString = JSON.stringify(privateKeyArray);
       const address = walletManager.getWalletAddress(userId);
 
-      const message = `
-🔑 *YOUR REAL SOLANA PRIVATE KEY*
+      const base58Key = bs58.encode(keypair.secretKey);
 
-*Wallet Address:*
+      const message = `
+🔑 *YOUR PRIVATE KEY*
+
+*Wallet:*
 \`${address}\`
 
-*Private Key (Array Format):*
-\`${privateKeyString}\`
+*Private Key (Base58):*
+\`${base58Key}\`
 
-*Base58 Format:*
-\`${Buffer.from(keypair.secretKey).toString('base64')}\`
-
-⚠️ *CRITICAL SECURITY WARNING:*
-• This is your ACTUAL private key - NOT a demo!
-• Keep this private key extremely secure
-• NEVER share it with anyone
-• Anyone with this key has COMPLETE access to your funds
-• Save it securely and DELETE this message immediately
-• You can import this key into Phantom, Solflare, or any Solana wallet
-
-💡 *How to Import:*
-1. Open your Solana wallet
-2. Select "Import Wallet"
-3. Paste the private key array above
-4. Your wallet will be imported with address: ${address}
+⚠️ *SAVE THIS & DELETE THIS MESSAGE*
+• Import into Phantom/Solflare with this key
+• Never share it with anyone
+• Anyone with this key controls your funds
       `;
 
       await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
@@ -3464,7 +3438,18 @@ Use /realtrade on when you're ready to trade with real funds.
       const userId = msg.from?.id || 0;
       const chatId = msg.chat.id;
 
-      // Get all paper trades
+      // Update all open positions with current prices before displaying
+      const openPositionsToUpdate = db.getOpenPositions(userId);
+      for (const pos of openPositionsToUpdate) {
+        try {
+          await tradingEngine.updatePosition(pos);
+        } catch (e) {
+          logger.debug(`Failed to update price for ${pos.symbol}`);
+        }
+        await this.sleep(200); // Rate limit
+      }
+
+      // Get all paper trades (now with updated prices)
       const paperTrades = db.getAllPaperTrades(userId);
       const paperBalance = db.getPaperBalance(userId);
 
@@ -3837,7 +3822,7 @@ Use /hunt to start hunting!
 
       // Calculate account growth
       const initialBalance = 100; // Default starting balance
-      const accountValue = balance + openPositions.reduce((sum, p) => sum + (p.amount * p.current_price), 0);
+      const accountValue = balance + openPositions.reduce((sum, p) => sum + (p.amount * p.currentPrice), 0);
       const growth = ((accountValue - initialBalance) / initialBalance * 100).toFixed(2);
 
       response += `📈 **Account Growth:** ${growth}%\n`;
@@ -3931,7 +3916,7 @@ Use /hunt to start hunting!
       let response = `🔗 **Connect Your Wallet**\n\n`;
 
       if (existingWallet) {
-        const maskedKey = existingWallet.public_key.substring(0, 6) + '...' + existingWallet.public_key.substring(existingWallet.public_key.length - 4);
+        const maskedKey = existingWallet.publicKey.substring(0, 6) + '...' + existingWallet.publicKey.substring(existingWallet.publicKey.length - 4);
         response += `✅ **Current Wallet:**\n`;
         response += `\`${maskedKey}\`\n\n`;
         response += `Choose an option:\n`;
